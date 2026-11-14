@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tma_toolkit"
 version = "0.1.0"
-description = "TMA core metadata, selection and comparison for Xenium data (AnnData)"
+description = "TMA core metadata, selection and comparison for CosMx / Xenium data (AnnData)"
 requires-python = ">=3.10"
 dependencies = [
   "anndata>=0.10",

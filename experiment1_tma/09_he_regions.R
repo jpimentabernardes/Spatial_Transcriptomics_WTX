@@ -2,18 +2,18 @@
 ## 09_he_regions.R
 ##
 ## H&E as the histology anchor: pathology regions drawn on the H&E are
-## transferred onto Xenium (and CellScape) cells, so Aim 2 can compare immune
-## targets between LOCATIONS WITHIN a core (tumour vs stroma vs invasive
-## margin vs lymphoid aggregate vs normal mucosa), not only between cores.
+## transferred onto the CosMx cells, so Aim 2 can compare immune targets between
+## LOCATIONS WITHIN a core (tumour vs stroma vs invasive margin vs lymphoid
+## aggregate vs normal mucosa), not only between cores.
 ##
-## Recommended set-up: H&E on the Xenium slide after the run (10x post-Xenium
-## H&E protocol) -> same section as the transcripts, so a global affine (07,
-## --mode he) is essentially exact. If the H&E is on another section, treat
-## it like CellScape (per-core refinement in 07).
+## Best set-up: H&E on the CosMx slide itself after the run -> same section as
+## the transcripts, so the landmark transform of 07 is accurate to a few cells.
+## An H&E of a neighbouring section aligns tissue structure only: draw regions
+## generously and do not read single cells at region borders.
 ##
 ## Workflow:
-##   1. Register: python 07_register_modalities.py --mode he ...
-##        -> data/registration/transforms_he_<slide>.json (H&E px -> Xenium um)
+##   1. Register: python 07_register_he.py --landmarks ...
+##        -> data/registration/transforms_he_<slide>.json (H&E px -> CosMx um)
 ##   2. Annotate regions on the H&E in QuPath (classes e.g. Tumor, Stroma,
 ##      Immune_aggregate, Normal_epithelium, Necrosis, Muscle). Export:
 ##      File > Export objects as GeoJSON (pixel coordinates, full resolution)
@@ -23,7 +23,7 @@
 ## Overlapping annotations: the SMALLEST polygon wins (e.g. an immune
 ## aggregate drawn inside a stroma region). Holes in polygons are ignored.
 ##
-## OUTPUT: xenium_<seg>_he.rds (adds `he_region`), tables/09_*.csv, figures/09_*.png
+## OUTPUT: cosmx_<seg>_he.rds (adds `he_region`), tables/09_*.csv, figures/09_*.png
 ## =============================================================================
 
 source("config/config.R")
@@ -32,7 +32,7 @@ source("R/helpers.R")
 ANNOT_GEOJSON_DIR <- file.path(PROJECT_DIR, "data", "he", "annotations")
 
 in_path <- c(obj_path("integrated"), obj_path("insights"), obj_path("annotated"))
-xen <- readRDS(in_path[file.exists(in_path)][1])
+cmx <- readRDS(in_path[file.exists(in_path)][1])
 cores_all <- utils::read.csv(file.path(TABLES_DIR, "02_cores_all.csv"), stringsAsFactors = FALSE)
 
 read_qupath_geojson <- function(path) {
@@ -61,10 +61,10 @@ apply_tf <- function(M, xy) {
 
 polygon_area <- function(xy) abs(sum(xy[, 1] * c(xy[-1, 2], xy[1, 2]) - c(xy[-1, 1], xy[1, 1]) * xy[, 2])) / 2
 
-xen$he_region <- NA_character_
-region <- stats::setNames(rep(NA_character_, ncol(xen)), colnames(xen))
+cmx$he_region <- NA_character_
+region <- stats::setNames(rep(NA_character_, ncol(cmx)), colnames(cmx))
 
-for (sid in unique(xen$slide_id)) {
+for (sid in unique(cmx$slide_id)) {
   tf_path <- file.path(REG_DIR, paste0("transforms_he_", sid, ".json"))
   gj_path <- file.path(ANNOT_GEOJSON_DIR, paste0(sid, ".geojson"))
   if (!file.exists(tf_path) || !file.exists(gj_path)) {
@@ -76,8 +76,8 @@ for (sid in unique(xen$slide_id)) {
   polys <- read_qupath_geojson(gj_path)
   cores_s <- cores_all[cores_all$slide_id == sid & !is.na(cores_all$core_id), ]
 
-  ## H&E px -> Xenium um (global), then the per-core correction of the core
-  ## the polygon falls in, if 07 refined that core.
+  ## H&E px -> CosMx um (global), then a per-core correction if the transform
+  ## file holds one for the core the polygon falls in.
   for (k in seq_along(polys)) {
     xy <- apply_tf(G, polys[[k]]$xy)
     cid <- assign_cells_to_cores(mean(xy[, 1]), mean(xy[, 2]), cores_s, factor = 2)
@@ -87,9 +87,9 @@ for (sid in unique(xen$slide_id)) {
   }
   polys <- polys[order(vapply(polys, `[[`, numeric(1), "area"))]   # smallest first
 
-  cells <- colnames(xen)[xen$slide_id == sid]
-  x <- xen$x_um[match(cells, colnames(xen))]
-  y <- xen$y_um[match(cells, colnames(xen))]
+  cells <- colnames(cmx)[cmx$slide_id == sid]
+  x <- cmx$x_um[match(cells, colnames(cmx))]
+  y <- cmx$y_um[match(cells, colnames(cmx))]
   reg_s <- rep(NA_character_, length(cells))
   for (p in polys) {
     inside <- is.na(reg_s) & sp::point.in.polygon(x, y, p$xy_um[, 1], p$xy_um[, 2]) > 0
@@ -101,14 +101,14 @@ for (sid in unique(xen$slide_id)) {
 
   ## Sanity plot: polygons over cells for a few cores. Misplaced polygons =
   ## wrong transform direction/landmarks, not a biology result.
-  show <- head(unique(xen$core_id[xen$slide_id == sid]), 6)
+  show <- head(unique(cmx$core_id[cmx$slide_id == sid]), 6)
   ## each polygon is drawn whole, in the facet of the core its centroid falls in
   poly_df <- dplyr::bind_rows(lapply(seq_along(polys), function(k) {
     xy <- polys[[k]]$xy_um
     data.frame(id = k, class = polys[[k]]$class, x_um = xy[, 1], y_um = xy[, 2],
                core_id = assign_cells_to_cores(mean(xy[, 1]), mean(xy[, 2]), cores_s, factor = 2))
   }))
-  d <- data.frame(core_id = xen$core_id[match(cells, colnames(xen))], x_um = x, y_um = y,
+  d <- data.frame(core_id = cmx$core_id[match(cells, colnames(cmx))], x_um = x, y_um = y,
                   he_region = ifelse(is.na(reg_s), "none", reg_s))
   d <- d[d$core_id %in% show, ]
   poly_df <- poly_df[poly_df$core_id %in% show, ]
@@ -116,16 +116,16 @@ for (sid in unique(xen$slide_id)) {
     geom_point(aes(color = he_region), size = 0.2) +
     geom_polygon(data = poly_df, aes(group = id), fill = NA, color = "black", linewidth = 0.3) +
     facet_wrap(~ core_id, scales = "free") + scale_y_reverse() + theme_bw() + theme(aspect.ratio = 1) +
-    ggtitle(paste0(sid, ": H&E annotations on Xenium cells"))
+    ggtitle(paste0(sid, ": H&E annotations on CosMx cells"))
   save_fig(p, paste0("09_he_regions_check_", sid), width = 14, height = 10)
 }
-xen$he_region <- unname(region)
+cmx$he_region <- unname(region)
 
 ## -----------------------------------------------------------------------
 ## Region-level summaries for Aim 2: composition and immune targets by
 ## region within organ (unit = core x region).
 ## -----------------------------------------------------------------------
-m <- xen[[]] |> filter(!is.na(he_region))
+m <- cmx[[]] |> filter(!is.na(he_region))
 if (nrow(m) > 0) {
   comp <- m |> count(organ, core_id, he_region, cell_type) |>
     group_by(core_id, he_region) |> mutate(frac = n / sum(n)) |> ungroup()
@@ -137,10 +137,10 @@ if (nrow(m) > 0) {
   save_fig(p_comp, "09_composition_by_he_region", width = 16, height = 10)
 
   probes <- read_config_csv(PROBE_EXPECT_CSV, stringsAsFactors = FALSE)
-  probes$gene <- match_case(as_seurat_features(probes$gene), rownames(xen[["Xenium"]]))
-  targets <- intersect(probes$gene[probes$category == "immune_target"], rownames(xen[["Xenium"]]))
+  probes$gene <- match_case(as_seurat_features(probes$gene), rownames(cmx[["CosMx"]]))
+  targets <- intersect(probes$gene[probes$category == "immune_target"], rownames(cmx[["CosMx"]]))
   if (length(targets) > 0) {
-    cnt <- GetAssayData(xen, assay = "Xenium", layer = "counts")[, rownames(m), drop = FALSE]
+    cnt <- GetAssayData(cmx, assay = "CosMx", layer = "counts")[, rownames(m), drop = FALSE]
     grp <- paste(m$core_id, m$he_region, sep = "||")
     ok <- names(which(table(grp) >= MIN_CELLS_PSEUDOBULK))
     pb <- pseudobulk(cnt[, grp %in% ok, drop = FALSE], grp[grp %in% ok])
@@ -159,5 +159,5 @@ if (nrow(m) > 0) {
   }
 }
 
-saveRDS(xen, obj_path("he"))
+saveRDS(cmx, obj_path("he"))
 message("Saved -> ", obj_path("he"))

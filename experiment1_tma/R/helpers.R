@@ -22,18 +22,15 @@ suppressPackageStartupMessages({
 ## -----------------------------------------------------------------------
 local({
   defaults <- list(
+    ASSAY = "CosMx", COSMX_PIXEL_SIZE_UM = 0.12028, COSMX_FLIP_Y = TRUE, COSMX_CHUNK_ROWS = 2000,
+    COSMX_NEG_REGEX = "^(Negative|NegPrb|NegProbe)", COSMX_SYS_REGEX = "^(SystemControl|FalseCode)",
+    MIN_SPLIT_RATIO = 0.5, FOV_MIN_CELLS = 50, FOV_MIN_MEDIAN_COUNTS = 50, FOV_MIN_RATIO_TO_CORE = 0.5,
     QC_MAP_POINT_SIZE = 0.3, QC_MAP_MAX_CELLS = 1e6,
-    PYTHON_BIN = Sys.getenv("EXP1_PYTHON", "python3"),
     INSPECT_WINDOW_UM = 150, INSPECT_N_PER_SLIDE = 3, INSPECT_CENTERS = NULL,
-    INSPECT_CELLPOSE = TRUE, INSPECT_CELLPOSE_MODE = "nuclei_expand", INSPECT_CELLPOSE_EXPAND_UM = 5,
-    PSEUDO_TMA_SLIDES = NULL, PSEUDO_CORE_DIAMETER_UM = 600, PSEUDO_CORE_PITCH_UM = 1000,
-    PSEUDO_MIN_CELLS = 500, PSEUDO_PATIENT_ID = NULL, PSEUDO_ORGAN = "colon", PSEUDO_CENTERS = NULL,
-    RES_CLUSTERS = 0.8, TOP_N_PER_CLUSTER = 5, MARKERS_MAX_CELLS = 2000,
-    CANONICAL_MARKERS = c("Epcam", "Mki67", "Lgr5", "Olfm4", "Stmn1", "Atoh1", "Apoa4", "Fabp1", "Alpi",
-                          "Slc26a3", "Car4", "Agr2", "Muc2", "Lyz1", "Defa5", "Mmp7", "Dclk1", "Trpm5",
-                          "Chga", "Cd3d", "Cd4", "Cd8a", "Foxp3", "Il7r", "Ccr5", "Gzmb", "Ncam1",
-                          "Cd79a", "Ighm", "Xcr1", "Itgax", "Itgam", "Csf1r", "Fcgr1", "Ly6c1", "Ly6g", "Siglecf"),
-    CLUSTER_TO_CELLTYPE = NULL, CLUSTER_TO_LINEAGE = NULL
+    N_HVG = 2000, RES_CLUSTERS = 0.8, TOP_N_PER_CLUSTER = 5, MARKERS_MAX_CELLS = 2000,
+    CLUSTER_TO_CELLTYPE = NULL, CLUSTER_TO_LINEAGE = NULL,
+    CMP_MIN_CELLS_CORE = 200, CMP_MIN_CELLS_GROUP = 50, CMP_REGISTER = TRUE, CMP_BIN_UM = 50,
+    CMP_MIN_NCC = 0.3
   )
   added <- character(0)
   for (k in names(defaults)) {
@@ -47,6 +44,10 @@ local({
             "\n  Copy them from the repository's config/config.R to change them.")
   }
 })
+
+## Per-cell totals as Seurat names them for the assay: nCount_CosMx / nFeature_CosMx
+COUNT_COL   <- paste0("nCount_", ASSAY)
+FEATURE_COL <- paste0("nFeature_", ASSAY)
 
 ## -----------------------------------------------------------------------
 ## Output helpers (same pattern as the class scripts)
@@ -68,7 +69,7 @@ save_table <- function(df, name) {
 }
 
 obj_path <- function(stage, segmentation = SEGMENTATION) {
-  file.path(PROCESSED_DIR, sprintf("xenium_%s_%s.rds", segmentation, stage))
+  file.path(PROCESSED_DIR, sprintf("cosmx_%s_%s.rds", segmentation, stage))
 }
 
 ## -----------------------------------------------------------------------
@@ -88,15 +89,20 @@ read_config_csv <- function(path, ...) {
 
 read_slides <- function(path = SLIDES_CSV) {
   s <- read_config_csv(path, stringsAsFactors = FALSE, check.names = FALSE)
-  stopifnot("slides.csv needs slide_id and xenium_dir" =
-              all(c("slide_id", "xenium_dir") %in% colnames(s)))
+  stopifnot("slides.csv needs slide_id and cosmx_dir" =
+              all(c("slide_id", "cosmx_dir") %in% colnames(s)))
   bad <- s$slide_id[s$slide_id != make.names(s$slide_id)]
   if (length(bad) > 0) {
     stop("slide_id must be a syntactically valid R name (used as FOV name): ",
          paste(bad, collapse = ", "), ". Use letters, digits, _ and . only.")
   }
-  for (col in c("row_flip", "col_flip", "cs_row_flip", "cs_col_flip")) {
+  for (col in c("row_flip", "col_flip")) {
     if (col %in% colnames(s)) s[[col]] <- as.logical(s[[col]]) %in% TRUE
+  }
+  for (col in c("cosmx_prefix", "xenium_slide_id")) {
+    if (!col %in% colnames(s)) s[[col]] <- NA_character_
+    s[[col]] <- as.character(s[[col]])
+    s[[col]][!is.na(s[[col]]) & !nzchar(s[[col]])] <- NA_character_
   }
   s
 }
@@ -152,9 +158,9 @@ read_marker_panel <- function(path) {
   out
 }
 
-## Keep only markers present in the panel; report what is missing. For a
-## targeted panel this is not cosmetic -- a cell type with 0-1 present
-## markers cannot be annotated reliably, and that is itself an Aim 1 finding.
+## Keep only markers present in the panel; report what is missing. On the whole
+## transcriptome nearly everything is present; a missing gene is then usually a
+## different symbol (alias) or a multi-gene probe such as "TPSAB1/B2".
 restrict_to_panel <- function(sig_list, panel_genes, label = "", min_reliable = 2) {
   sig_list <- lapply(sig_list, match_case, features = panel_genes)
   cov <- data.frame(
@@ -173,9 +179,13 @@ restrict_to_panel <- function(sig_list, panel_genes, label = "", min_reliable = 
 }
 
 ## -----------------------------------------------------------------------
-## Xenium feature types. 10x ships several control-feature classes next to
-## the genes; they are the basis of every background / specificity estimate
-## in this project, so keep them (as per-cell metadata), don't discard them.
+## Feature types. Next to the genes, both platforms ship control features;
+## they are the basis of every background / specificity estimate in this
+## project, so keep them (as per-cell metadata), don't discard them.
+##   CosMx negative probes  ("Negative1", ...)      -> ControlProbe
+##   CosMx system controls  ("SystemControl1", ...) -> ControlCodeword
+## (the 10x names are kept so that a segmentation written in the common
+## 10x-style format, and the Xenium object in 10, use the same columns)
 ## -----------------------------------------------------------------------
 CONTROL_SHORT <- c(
   "Negative Control Probe"    = "ControlProbe",
@@ -190,8 +200,274 @@ control_short_name <- function(type) {
   ifelse(type %in% names(CONTROL_SHORT), CONTROL_SHORT[type], make.names(type))
 }
 
-## Reads a 10x-style cell_feature_matrix (directory or .h5). Always returns a
-## named list by feature type, even if there is only gene expression.
+cosmx_feature_type <- function(names) {
+  ifelse(grepl(COSMX_NEG_REGEX, names), "Negative Control Probe",
+         ifelse(grepl(COSMX_SYS_REGEX, names), "Negative Control Codeword", "Gene Expression"))
+}
+
+## -----------------------------------------------------------------------
+## CosMx flat files (the "Flat Files" export of AtoMx). One set per slide:
+##   <prefix>_exprMat_file.csv.gz        cells x targets counts (fov, cell_ID, genes, Negative*, SystemControl*)
+##   <prefix>_metadata_file.csv.gz       one row per cell: position, area, stain intensities, AtoMx QC
+##   <prefix>_fov_positions_file.csv.gz  position of every field of view on the slide
+##   <prefix>_tx_file.csv.gz             one row per transcript (large; not needed for 01-05, used by 03)
+##   <prefix>-polygons.csv.gz            cell outlines (only used for the zoom figures of 01)
+## -----------------------------------------------------------------------
+COSMX_FILE_PATTERNS <- c(
+  expr     = "exprMat_file\\.csv(\\.gz)?$",
+  metadata = "metadata_file\\.csv(\\.gz)?$",
+  fov      = "fov_positions_file\\.csv(\\.gz)?$",
+  tx       = "tx_file\\.csv(\\.gz)?$",
+  polygons = "polygons\\.csv(\\.gz)?$"
+)
+
+## Finds the flat files of one slide anywhere below `dir` (AtoMx nests them in
+## flatFiles/<slide>/). Returns a named list of paths, NA where a file is absent.
+find_cosmx_files <- function(dir, prefix = NA) {
+  if (is.na(dir) || !dir.exists(dir)) stop("CosMx folder not found: ", dir, " (cosmx_dir in config/slides.csv)")
+  all <- list.files(dir, recursive = TRUE, full.names = TRUE)
+  out <- lapply(COSMX_FILE_PATTERNS, function(pat) {
+    f <- all[grepl(pat, basename(all), ignore.case = TRUE)]
+    if (!is.na(prefix) && nzchar(prefix)) f <- f[startsWith(basename(f), prefix)]
+    ## the same file zipped and unzipped: keep the zipped one
+    f[!(paste0(f, ".gz") %in% f)]
+  })
+  multi <- names(out)[lengths(out) > 1]
+  if (length(multi) > 0) {
+    stop("Several ", paste(multi, collapse = " / "), " files below ", dir, ":\n  ",
+         paste(basename(unlist(out[multi])), collapse = "\n  "),
+         "\n  Point cosmx_dir at the folder of ONE slide, or set cosmx_prefix in slides.csv ",
+         "(the start of this slide's file names).")
+  }
+  lapply(out, function(f) if (length(f) == 0) NA_character_ else f)
+}
+
+open_text <- function(path) if (grepl("\\.gz$", path)) gzfile(path, "rt") else file(path, "rt")
+
+csv_header <- function(path) {
+  con <- open_text(path)
+  on.exit(close(con))
+  gsub('^"|"$', "", strsplit(readLines(con, n = 1), ",", fixed = TRUE)[[1]])
+}
+
+## fov + per-FOV cell number from whatever id columns a table has. `cell_ID`
+## (capital ID) is the number of the cell WITHIN its FOV; `cell` / `cell_id`
+## is the study-wide name c_<slide>_<fov>_<cell_ID>.
+cosmx_cell_keys <- function(d) {
+  cn <- colnames(d)
+  num <- intersect(c("cell_ID", "cellID", "CellId"), cn)[1]
+  if ("fov" %in% cn && !is.na(num)) {
+    return(data.frame(fov = as.integer(d$fov), cell_ID = as.integer(d[[num]])))
+  }
+  name <- intersect(c("cell", "cell_id"), cn)[1]
+  if (is.na(name)) stop("No cell identifier found (need fov + cell_ID, or cell = c_<slide>_<fov>_<cell_ID>).")
+  parts <- regmatches(as.character(d[[name]]), regexec("_([0-9]+)_([0-9]+)$", as.character(d[[name]])))
+  ok <- lengths(parts) == 3
+  if (!all(ok)) stop("Cell names in column `", name, "` are not of the form c_<slide>_<fov>_<cell_ID>.")
+  data.frame(fov = as.integer(vapply(parts, `[`, "", 2)), cell_ID = as.integer(vapply(parts, `[`, "", 3)))
+}
+
+## The expression matrix is a DENSE csv: one row per cell, one column per target.
+## For the whole transcriptome that is ~19,000 columns, so reading it in one go
+## needs (cells x 19,000 x 4 bytes) -- 38 GB for 500,000 cells. It is read in
+## chunks of rows instead; each chunk becomes a sparse matrix straight away.
+## Rows with cell_ID 0 are not cells: they hold the transcripts of one FOV that
+## lie outside every cell. They are returned separately (`unassigned`).
+read_cosmx_expr <- function(path, chunk_rows = COSMX_CHUNK_ROWS) {
+  con <- open_text(path)
+  on.exit(close(con))
+  header <- gsub('^"|"$', "", strsplit(readLines(con, n = 1), ",", fixed = TRUE)[[1]])
+  is_id <- header %in% c("fov", "cell_ID", "cellID", "cell", "cell_id", "V1", "")
+  feats <- header[!is_id]
+  if (length(feats) < 10) stop("Fewer than 10 target columns in ", path, " -- is this the exprMat file?")
+  pieces <- list(); keys <- list(); n_done <- 0L
+  repeat {
+    lines <- readLines(con, n = chunk_rows)
+    if (length(lines) == 0) break
+    d <- data.table::fread(text = lines, header = FALSE, sep = ",", showProgress = FALSE, data.table = FALSE)
+    if (ncol(d) != length(header)) stop("Row with ", ncol(d), " fields, header has ", length(header), ": ", path)
+    colnames(d) <- header
+    keys[[length(keys) + 1L]] <- cosmx_cell_keys(d[, is_id, drop = FALSE])
+    m <- as.matrix(d[, !is_id, drop = FALSE])
+    storage.mode(m) <- "double"
+    pieces[[length(pieces) + 1L]] <- methods::as(methods::as(t(m), "CsparseMatrix"), "generalMatrix")
+    n_done <- n_done + nrow(d)
+    if (length(pieces) %% 25 == 0) message("  ... ", format(n_done, big.mark = ","), " rows")
+  }
+  if (length(pieces) == 0) stop("No rows in ", path)
+  counts <- do.call(cbind, pieces)
+  rm(pieces)
+  keys <- do.call(rbind, keys)
+  dimnames(counts) <- list(feats, paste(keys$fov, keys$cell_ID, sep = "_"))
+  type <- cosmx_feature_type(feats)
+
+  outside <- keys$cell_ID == 0
+  unassigned <- NULL
+  if (any(outside)) {
+    u <- counts[, outside, drop = FALSE]
+    unassigned <- data.frame(fov = keys$fov[outside],
+                             n_outside_genes = Matrix::colSums(u[type == "Gene Expression", , drop = FALSE]),
+                             n_outside_controls = Matrix::colSums(u[type != "Gene Expression", , drop = FALSE]))
+    counts <- counts[, !outside, drop = FALSE]
+  }
+  dup <- duplicated(colnames(counts))
+  if (any(dup)) stop(sum(dup), " duplicated fov + cell_ID in ", path, " -- several slides in one file? ",
+                     "Export one flat-file set per slide.")
+  message("  ", format(ncol(counts), big.mark = ","), " cells x ", sum(type == "Gene Expression"), " genes, ",
+          sum(type == "Negative Control Probe"), " negative probes, ",
+          sum(type == "Negative Control Codeword"), " system controls")
+  list(counts = lapply(split(seq_along(feats), factor(type, levels = unique(type))),
+                       function(i) counts[i, , drop = FALSE]),
+       unassigned = unassigned)
+}
+
+## Slide frame: how CosMx global pixels become the microns used everywhere here.
+cosmx_frame <- function(y_px, flip = COSMX_FLIP_Y, pixel_size = COSMX_PIXEL_SIZE_UM) {
+  list(pixel_size_um = pixel_size, flip_y = isTRUE(flip), y_ref_px = if (isTRUE(flip)) max(y_px, na.rm = TRUE) else 0)
+}
+cosmx_px_to_um <- function(x_px, y_px, frame) {
+  data.frame(x = x_px * frame$pixel_size_um,
+             y = (if (frame$flip_y) frame$y_ref_px - y_px else y_px) * frame$pixel_size_um)
+}
+
+## Cell metadata (flat file or the meta.data of an AtoMx Seurat export) -> the
+## cells table of the common format: cell_id, x_centroid, y_centroid (um),
+## cell_area, nucleus_area (um2) + everything worth keeping from CosMx:
+##   fov, cosmx_cell (AtoMx name), x_global_px / y_global_px (original frame),
+##   split_ratio (FOV-border cells), IF_<stain> (mean stain intensity per cell,
+##   e.g. IF_PanCK, IF_CD45, IF_DAPI) and AtoMx's own QC flags (atomx_*).
+standardise_cosmx_metadata <- function(md, fov_positions = NULL) {
+  cn <- colnames(md)
+  keys <- cosmx_cell_keys(md)
+  px <- COSMX_PIXEL_SIZE_UM
+  if (all(c("CenterX_global_px", "CenterY_global_px") %in% cn)) {
+    x_px <- md$CenterX_global_px; y_px <- md$CenterY_global_px
+  } else if (all(c("x_slide_mm", "y_slide_mm") %in% cn)) {
+    x_px <- md$x_slide_mm * 1000 / px; y_px <- md$y_slide_mm * 1000 / px
+  } else if (all(c("CenterX_local_px", "CenterY_local_px") %in% cn) && !is.null(fov_positions)) {
+    ## legacy exports without global centres: FOV origin + position in the FOV
+    k <- match(keys$fov, fov_positions$fov)
+    if (anyNA(k)) stop("FOVs in the metadata that are not in the fov_positions file.")
+    x_px <- md$CenterX_local_px + fov_positions$x_global_px[k]
+    y_px <- md$CenterY_local_px + fov_positions$y_global_px[k]
+    message("  no CenterX_global_px in the metadata: global = FOV position + local position (legacy rule).")
+  } else {
+    stop("The metadata has no cell positions (CenterX_global_px / CenterY_global_px).")
+  }
+  frame <- cosmx_frame(y_px)
+  xy <- cosmx_px_to_um(x_px, y_px, frame)
+  area <- if ("Area.um2" %in% cn) md$Area.um2 else if ("Area" %in% cn) md$Area * px^2 else NA_real_
+  nuc <- if ("NucArea" %in% cn) ifelse(md$NucArea > 0, md$NucArea * px^2, NA_real_) else NA_real_
+  cells <- data.frame(
+    cell_id = paste(keys$fov, keys$cell_ID, sep = "_"),
+    x_centroid = xy$x, y_centroid = xy$y, cell_area = area, nucleus_area = nuc,
+    segmentation_method = "cosmx",
+    fov = keys$fov,
+    cosmx_cell = if ("cell" %in% cn) as.character(md$cell) else if ("cell_id" %in% cn) as.character(md$cell_id) else NA_character_,
+    x_global_px = x_px, y_global_px = y_px,
+    split_ratio = if ("SplitRatioToLocal" %in% cn) md$SplitRatioToLocal else NA_real_,
+    stringsAsFactors = FALSE
+  )
+  stains <- grep("^Mean\\.", cn, value = TRUE)
+  for (s in stains) cells[[paste0("IF_", make.names(sub("^Mean\\.", "", s)))]] <- md[[s]]
+  keep <- intersect(c("qcFlagsFOV", "qcCellsFlagged", "qcFlagsRNACounts", "qcFlagsCellCounts", "qcFlagsCellPropNeg",
+                      "qcFlagsCellComplex", "qcFlagsCellArea", "Panel", "version", "Run_Tissue_name",
+                      "cellSegmentationSetName", "unassignedTranscripts"), cn)
+  for (k in keep) cells[[paste0("atomx_", k)]] <- md[[k]]
+  cells <- cells[keys$cell_ID != 0, , drop = FALSE]
+  attr(cells, "frame") <- frame
+  cells
+}
+
+read_cosmx_fov_positions <- function(path) {
+  if (is.na(path)) return(NULL)
+  f <- data.table::fread(path, data.table = FALSE, showProgress = FALSE)
+  colnames(f)[tolower(colnames(f)) == "fov"] <- "fov"
+  ## pixel columns where present; some exports only have mm
+  for (ax in c("x", "y")) {
+    px <- paste0(ax, "_global_px"); mm <- intersect(c(paste0(ax, "_global_mm"), paste0(toupper(ax), "_mm"), paste0(ax, "_mm")), colnames(f))[1]
+    if (!px %in% colnames(f) && !is.na(mm)) f[[px]] <- f[[mm]] * 1000 / COSMX_PIXEL_SIZE_UM
+  }
+  f
+}
+
+read_cosmx_metadata <- function(path, fov_path = NA) {
+  md <- data.table::fread(path, data.table = FALSE, showProgress = FALSE)
+  standardise_cosmx_metadata(md, read_cosmx_fov_positions(fov_path))
+}
+
+## Cell outlines of the polygons file, in the same microns as the centroids.
+read_cosmx_polygons <- function(path, frame) {
+  p <- data.table::fread(path, data.table = FALSE, showProgress = FALSE)
+  keys <- cosmx_cell_keys(p)
+  xy <- cosmx_px_to_um(p$x_global_px, p$y_global_px, frame)
+  data.frame(cell_id = paste(keys$fov, keys$cell_ID, sep = "_"), vertex_x = xy$x, vertex_y = xy$y)
+}
+
+## AtoMx can also export a Seurat object (.RDS) instead of flat files: counts in
+## assay "RNA", negative probes in "negprobes", system controls in "falsecode",
+## the flat-file metadata columns in meta.data. Written from the documented
+## structure and tested on a mock object only -- check 00's report on a real one.
+read_cosmx_seurat <- function(path) {
+  so <- readRDS(path)
+  get_counts <- function(assay) {
+    if (!assay %in% Assays(so)) return(NULL)
+    tryCatch(GetAssayData(so, assay = assay, layer = "counts"),
+             error = function(e) GetAssayData(so, assay = assay, slot = "counts"))
+  }
+  gex <- get_counts("RNA") %||% get_counts(DefaultAssay(so))
+  cells <- standardise_cosmx_metadata(so[[]])
+  frame <- attr(cells, "frame")
+  keys <- cosmx_cell_keys(so[[]])
+  nm <- paste(keys$fov, keys$cell_ID, sep = "_")
+  counts <- list("Gene Expression" = gex)
+  type <- cosmx_feature_type(rownames(gex))
+  if (any(type != "Gene Expression")) {                 # controls left inside the RNA assay
+    for (t in setdiff(unique(type), "Gene Expression")) counts[[t]] <- gex[type == t, , drop = FALSE]
+    counts[["Gene Expression"]] <- gex[type == "Gene Expression", , drop = FALSE]
+  }
+  if (!is.null(neg <- get_counts("negprobes"))) counts[["Negative Control Probe"]] <- neg
+  if (!is.null(sys <- get_counts("falsecode"))) counts[["Negative Control Codeword"]] <- sys
+  counts <- lapply(counts, function(m) { colnames(m) <- nm; m[, keys$cell_ID != 0, drop = FALSE] })
+  attr(cells, "frame") <- frame
+  list(counts = counts, cells = cells, unassigned = NULL, frame = frame, files = list(seurat = path))
+}
+
+## One slide from flat files. The parsed expression matrix is cached next to
+## the processed objects (parsing 19,000 columns takes minutes); the cache is
+## rebuilt when the exprMat file changes.
+read_cosmx_flat <- function(dir, prefix = NA, slide_id = basename(dir), cache = TRUE) {
+  files <- find_cosmx_files(dir, prefix)
+  if (is.na(files$expr) || is.na(files$metadata)) {
+    stop("No *exprMat_file.csv(.gz) and/or *metadata_file.csv(.gz) below ", dir,
+         "\n  Run 00_cosmx_inspect_input.R to see what the folder contains.")
+  }
+  cache_file <- file.path(PROCESSED_DIR, "cosmx_cache", paste0(make.names(slide_id), "_exprMat.rds"))
+  stamp <- paste(normalizePath(files$expr), file.size(files$expr), as.numeric(file.mtime(files$expr)), COSMX_NEG_REGEX,
+                 COSMX_SYS_REGEX)
+  expr <- NULL
+  if (cache && file.exists(cache_file)) {
+    cached <- readRDS(cache_file)
+    if (identical(cached$stamp, stamp)) { expr <- cached$expr; message("  expression matrix from cache: ", cache_file) }
+  }
+  if (is.null(expr)) {
+    message("  reading ", basename(files$expr), " in chunks of ", COSMX_CHUNK_ROWS, " rows ...")
+    expr <- read_cosmx_expr(files$expr)
+    if (cache) {
+      dir.create(dirname(cache_file), showWarnings = FALSE, recursive = TRUE)
+      saveRDS(list(stamp = stamp, expr = expr), cache_file)
+    }
+  }
+  cells <- read_cosmx_metadata(files$metadata, files$fov)
+  list(counts = expr$counts, cells = cells, unassigned = expr$unassigned, frame = attr(cells, "frame"), files = files)
+}
+
+## -----------------------------------------------------------------------
+## Common segmentation format (10x-style), for a segmentation made outside
+## AtoMx: <dir>/cell_feature_matrix/{matrix.mtx.gz, features.tsv.gz, barcodes.tsv.gz}
+## and <dir>/cells.csv.gz (cell_id, x_centroid, y_centroid, cell_area, nucleus_area;
+## microns in the frame of 01, see tables/01_cosmx_frame.csv).
+## -----------------------------------------------------------------------
 read_feature_matrix <- function(seg_dir) {
   mtx_dir <- file.path(seg_dir, "cell_feature_matrix")
   h5 <- file.path(seg_dir, "cell_feature_matrix.h5")
@@ -203,6 +479,13 @@ read_feature_matrix <- function(seg_dir) {
     stop("No cell_feature_matrix/ or cell_feature_matrix.h5 in ", seg_dir)
   }
   if (!is.list(counts)) counts <- list("Gene Expression" = counts)
+  ## a writer that did not label the controls: split them off by name
+  gex <- counts[["Gene Expression"]]
+  type <- cosmx_feature_type(rownames(gex))
+  for (t in setdiff(unique(type), "Gene Expression")) {
+    counts[[t]] <- if (is.null(counts[[t]])) gex[type == t, , drop = FALSE] else rbind(counts[[t]], gex[type == t, , drop = FALSE])
+  }
+  counts[["Gene Expression"]] <- gex[type == "Gene Expression", , drop = FALSE]
   counts
 }
 
@@ -222,24 +505,31 @@ read_cells_table <- function(seg_dir) {
 }
 
 ## Builds one Seurat object per slide with an identical structure for every
-## segmentation method, so downstream code never branches on method:
-##   - assay "Xenium" = genes only
-##   - controls summed into metadata: nCount_ControlProbe, nCount_BlankCodeword, ...
-##     plus nFeatTotal_<type> (number of control features on the panel), needed
-##     to turn control counts into a per-probe background rate
+## segmentation, so downstream code never branches on it:
+##   - assay ASSAY ("CosMx") = genes only
+##   - controls summed into metadata: nCount_ControlProbe (negative probes),
+##     nCount_ControlCodeword (system controls) plus nFeatTotal_<type> (number of
+##     control features on the panel), needed to turn control counts into a
+##     per-probe background rate
 ##   - x_um / y_um centroids in metadata AND as a centroid FOV named slide_id
-##   - cells named <slide_id>_<cell_id> (10x cell ids are NOT unique across slides)
+##     ("FOV" here is Seurat's word for one image = one slide; the CosMx field of
+##     view of a cell is the metadata column `fov`)
+##   - cells named <slide_id>_<fov>_<cell_ID> (CosMx cell ids repeat across FOVs and slides)
 ## Only centroids are loaded (no polygons): polygons for multi-slide TMAs cost
-## many GB and are what broke subset() in the class integration script.
-build_xenium_object <- function(slide_id, counts_list, cells, segmentation) {
+## many GB and are not needed for any statistic here.
+build_slide_object <- function(slide_id, counts_list, cells, segmentation) {
   gex <- counts_list[["Gene Expression"]]
   stopifnot("No 'Gene Expression' features found" = !is.null(gex))
 
   common <- intersect(colnames(gex), cells$cell_id)
   if (length(common) < ncol(gex)) {
     message(slide_id, ": ", ncol(gex) - length(common),
-            " cells in the matrix have no centroid and are dropped.")
+            " cells in the matrix have no metadata row (no centroid) and are dropped.")
   }
+  if (length(common) < nrow(cells)) {
+    message(slide_id, ": ", nrow(cells) - length(common), " cells in the metadata are not in the matrix and are dropped.")
+  }
+  if (length(common) == 0) stop(slide_id, ": no cell is in both the expression matrix and the metadata.")
   gex <- gex[, common, drop = FALSE]
   cells <- cells[match(common, cells$cell_id), , drop = FALSE]
   new_names <- paste0(slide_id, "_", common)
@@ -257,6 +547,9 @@ build_xenium_object <- function(slide_id, counts_list, cells, segmentation) {
     row.names = new_names,
     stringsAsFactors = FALSE
   )
+  extra <- setdiff(colnames(cells), c("cell_id", "x_centroid", "y_centroid", "cell_area", "nucleus_area",
+                                      "segmentation_method", "core_id"))
+  for (col in extra) meta[[col]] <- cells[[col]]
   for (type in setdiff(names(counts_list), "Gene Expression")) {
     short <- control_short_name(type)
     m <- counts_list[[type]][, common, drop = FALSE]
@@ -267,11 +560,11 @@ build_xenium_object <- function(slide_id, counts_list, cells, segmentation) {
   }
   meta$nFeatTotal_Gene <- nrow(gex)
 
-  obj <- CreateSeuratObject(counts = gex, assay = "Xenium", meta.data = meta)
+  obj <- CreateSeuratObject(counts = gex, assay = ASSAY, meta.data = meta)
   fov <- CreateFOV(
     coords = data.frame(x = meta$x_um, y = meta$y_um, cell = rownames(meta)),
     type = "centroids",
-    assay = "Xenium",
+    assay = ASSAY,
     key = fov_key(slide_id)
   )
   obj[[slide_id]] <- fov
@@ -279,21 +572,32 @@ build_xenium_object <- function(slide_id, counts_list, cells, segmentation) {
 }
 
 seg_dir_for <- function(slide_row, segmentation) {
-  if (segmentation == "xenium") return(resolve_path(slide_row$xenium_dir))
+  if (segmentation == "cosmx") return(resolve_path(slide_row$cosmx_dir))
   file.path(SEG_DIR, segmentation, slide_row$slide_id)
 }
 
-load_segmentation <- function(slide_row, segmentation = SEGMENTATION) {
+## Returns list(obj, frame, unassigned, files). The input kind is recognised
+## from what is there: an .rds file (AtoMx Seurat export), a folder with
+## cell_feature_matrix/ (common format) or a folder with flat files.
+load_slide <- function(slide_row, segmentation = SEGMENTATION) {
   d <- seg_dir_for(slide_row, segmentation)
-  stopifnot("Segmentation output folder not found" = dir.exists(d))
-  message("Loading ", slide_row$slide_id, " [", segmentation, "] from ", d)
-  build_xenium_object(
-    slide_id = slide_row$slide_id,
-    counts_list = read_feature_matrix(d),
-    cells = read_cells_table(d),
-    segmentation = segmentation
-  )
+  sid <- slide_row$slide_id
+  message("Loading ", sid, " [", segmentation, "] from ", d)
+  if (!is.na(d) && grepl("\\.rds$", d, ignore.case = TRUE) && file.exists(d)) {
+    x <- read_cosmx_seurat(d)
+  } else if (!is.na(d) && dir.exists(d) &&
+             (dir.exists(file.path(d, "cell_feature_matrix")) || file.exists(file.path(d, "cell_feature_matrix.h5")))) {
+    x <- list(counts = read_feature_matrix(d), cells = read_cells_table(d), unassigned = NULL, frame = NULL,
+              files = list(common_format = d))
+  } else {
+    x <- read_cosmx_flat(d, slide_row$cosmx_prefix %||% NA,
+                         slide_id = if (segmentation == "cosmx") sid else paste0(sid, "_", segmentation))
+  }
+  list(obj = build_slide_object(sid, x$counts, x$cells, segmentation),
+       frame = x$frame, unassigned = x$unassigned, files = x$files)
 }
+
+load_segmentation <- function(slide_row, segmentation = SEGMENTATION) load_slide(slide_row, segmentation)$obj
 
 ## merge() keeps one FOV per slide (named by slide_id). JoinLayers() because
 ## v5 merge splits counts into counts.1, counts.2, ... per input object.
@@ -461,8 +765,8 @@ sort_levels <- function(v) {
 }
 
 ## Optional polygon mode: one CSV per core in config/core_selections/<slide_id>/,
-## file name = core_id, with X/Y columns in microns (e.g. Xenium Explorer
-## "Download selection coordinates"; lines starting with # are skipped).
+## file name = core_id, with X/Y columns in microns of the 01 frame (x_um / y_um,
+## as on the axes of the 01 maps; lines starting with # are skipped).
 read_core_selections <- function(sel_dir) {
   files <- list.files(sel_dir, pattern = "\\.csv$", full.names = TRUE)
   lapply(stats::setNames(files, tools::file_path_sans_ext(basename(files))), function(f) {
@@ -489,7 +793,7 @@ assign_cells_to_polygons <- function(x, y, polygons) {
 ## -----------------------------------------------------------------------
 
 ## Adds one score column per signature named score_<signature>.
-score_signatures <- function(obj, sigs, use_ucell = USE_UCELL, assay = "Xenium") {
+score_signatures <- function(obj, sigs, use_ucell = USE_UCELL, assay = ASSAY) {
   sigs <- sigs[lengths(sigs) > 0]
   if (length(sigs) == 0) stop("score_signatures: no signature has any gene on the panel -- see the panel coverage table")
   DefaultAssay(obj) <- assay
@@ -529,7 +833,7 @@ score_signatures <- function(obj, sigs, use_ucell = USE_UCELL, assay = "Xenium")
 ## cells with counts), computed straight from the assay's data layer. Replaces
 ## Seurat::DotPlot, which goes through FetchData() and fails ("non-numeric argument
 ## to mathematical function") when a metadata column is returned instead of a gene.
-marker_dotplot <- function(obj, features, group.by, assay = "Xenium", layer = "data", log_data = TRUE) {
+marker_dotplot <- function(obj, features, group.by, assay = ASSAY, layer = "data", log_data = TRUE) {
   features <- intersect(unique(features), rownames(obj[[assay]]))
   if (length(features) == 0) stop("marker_dotplot: none of the features are in assay ", assay)
   m <- GetAssayData(obj, assay = assay, layer = layer)[features, , drop = FALSE]
@@ -808,20 +1112,21 @@ plot_cores_spatial <- function(meta, color_by, cores = NULL, facet = TRUE,
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
 ## -----------------------------------------------------------------------
-## Zoomed QC inspection: cells (pass / fail) on top of the morphology image
+## Zoomed QC inspection: cells (pass / fail) with their outlines
 ## -----------------------------------------------------------------------
 
 ## First failing QC reason per cell ("pass" if none) -- for colouring.
 qc_reason <- function(meta) {
   r <- rep("pass", nrow(meta))
   r[meta$qc_high_control] <- "high control"
+  if ("qc_fov_border" %in% colnames(meta)) r[meta$qc_fov_border] <- "FOV border"
   r[meta$qc_large] <- "too large"
   r[meta$qc_small] <- "too small"
   r[meta$qc_low_counts] <- "low counts"
-  factor(r, levels = c("pass", "low counts", "too small", "too large", "high control"))
+  factor(r, levels = c("pass", "low counts", "too small", "too large", "FOV border", "high control"))
 }
 QC_REASON_COLORS <- c(`pass` = "#9ec5f4", `low counts` = "#eda100", `too small` = "#e34948",
-                      `too large` = "#eb6834", `high control` = "#e87ba4")
+                      `too large` = "#eb6834", `FOV border` = "#8e6bbf", `high control` = "#e87ba4")
 
 ## Windows (square, window_um wide) that contain BOTH passing and failing cells:
 ## the slide is cut into a grid and the windows with the most balanced mix
@@ -844,125 +1149,40 @@ pick_inspection_windows <- function(meta, window_um = 150, n_per_slide = 3, min_
              n_cells = w$n, n_pass = w$n_pass, n_fail = w$n_fail)
 }
 
-## Crop the morphology image (and cell / nucleus outlines) for one window via
-## py/crop_region.py. Python does the reading because Xenium OME-TIFFs are tiled,
-## pyramidal and compressed in ways R's TIFF readers do not handle reliably.
-## cellpose = list(mode, expand_um, max_area) runs cellpose on the window as well
-## (see py/crop_region.py) and returns its cells / outlines in $cp_cells, $cp_outlines.
-crop_morphology <- function(xenium_dir, x0, y0, x1, y1, tag, image = NULL, cellpose = NULL,
-                            python = PYTHON_BIN, out_dir = file.path(PROCESSED_DIR, "inspection")) {
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-  prefix <- file.path(out_dir, tag)
-  args <- c(file.path(CODE_DIR, "py", "crop_region.py"), "--xenium-dir", shQuote(xenium_dir),
-            "--x0", x0, "--y0", y0, "--x1", x1, "--y1", y1, "--out-prefix", shQuote(prefix))
-  if (!is.null(image)) args <- c(args, "--image", shQuote(image))
-  if (!is.null(cellpose)) {
-    args <- c(args, "--cellpose", "--cellpose-mode", cellpose$mode, "--cellpose-expand-um", cellpose$expand_um,
-              "--min-qv", MIN_QV, "--min-counts", MIN_COUNTS, "--min-features", MIN_FEATURES,
-              "--min-area", MIN_CELL_AREA, "--max-control-frac", MAX_CONTROL_FRAC)
-    if (!is.null(cellpose$max_area) && is.finite(cellpose$max_area)) args <- c(args, "--max-area", cellpose$max_area)
-    if (!is.null(cellpose$masks_dir) && dir.exists(cellpose$masks_dir)) {
-      args <- c(args, "--cellpose-masks-dir", shQuote(cellpose$masks_dir))
-    }
-  }
-  out <- system2(python, args, stdout = TRUE, stderr = TRUE)
-  status <- attr(out, "status")
-  if (!is.null(status) && status != 0) {
-    stop("crop_region.py failed (set PYTHON_BIN in config.R to a Python with tifffile + zarr):\n",
-         paste(utils::tail(out, 10), collapse = "\n"))
-  }
-  read_b <- function(kind) {
-    f <- paste0(prefix, "_", kind, "_boundaries.csv.gz")
-    if (file.exists(f)) utils::read.csv(f, stringsAsFactors = FALSE) else NULL
-  }
-  out <- list(image = tiff::readTIFF(paste0(prefix, "_image.tif"), as.is = TRUE),
-              meta = jsonlite::fromJSON(paste0(prefix, "_meta.json")),
-              cells = read_b("cell"), nuclei = read_b("nucleus"))
-  if (!is.null(cellpose)) {
-    if (!is.null(out$meta$cellpose_error)) {
-      message("  cellpose on window ", tag, " failed: ", out$meta$cellpose_error)
-    } else {
-      out$cp_cells <- utils::read.csv(paste0(prefix, "_cellpose_cells.csv"), stringsAsFactors = FALSE)
-      out$cp_outlines <- read_b("cellpose_cell")
-      out$cp_nuclei <- read_b("cellpose_nucleus")
-      message("  cellpose (", out$meta$cellpose_source, "): ", out$meta$n_cellpose_cells, " cells near the window, ",
-              out$meta$cellpose_seconds, " s")
-    }
-  }
-  out
-}
-
-## Three panels: where the window is on the slide | morphology alone |
-## morphology + cell outlines (or centroids) coloured by QC result.
-## y is plotted as -y so the image keeps its orientation (y grows downwards).
-## Side-by-side segmentations of one window (03c): DAPI | 10x outlines |
-## cellpose outlines | both. crop = crop_morphology(..., cellpose = ...);
-## xen_cells = 10x cell metadata of the slide (x_um, y_um, nCount_Xenium).
-plot_segmentation_compare <- function(crop, win, xen_cells, title = "") {
-  m <- crop$meta
-  img <- crop$image
-  lim <- stats::quantile(img, c(0.01, 0.997), na.rm = TRUE)
-  g <- pmin(pmax((img - lim[1]) / max(lim[2] - lim[1], 1), 0), 1)^0.6
-  bg <- annotation_raster(grDevices::as.raster(g), xmin = m$x0_um, xmax = m$x1_um, ymin = -m$y1_um, ymax = -m$y0_um)
-  frame <- list(coord_fixed(xlim = c(win$x0, win$x1), ylim = c(-win$y1, -win$y0), expand = FALSE),
-                theme_void(), theme(plot.title = element_text(size = 10)))
-  inw <- function(x, y) x >= win$x0 & x <= win$x1 & y >= win$y0 & y <= win$y1
-  outl <- function(p, b, colour) {
-    if (is.null(b) || nrow(b) == 0) return(p)
-    p + geom_polygon(data = b, aes(vertex_x, -vertex_y, group = cell_id), fill = NA, colour = colour, linewidth = 0.35)
-  }
-  x10 <- xen_cells[inw(xen_cells$x_um, xen_cells$y_um), , drop = FALSE]
-  p_img <- ggplot() + bg + frame + ggtitle("DAPI")
-  p_10x <- outl(ggplot() + bg, crop$cells, "#00e5ff") + frame +
-    ggtitle(sprintf("10x Xenium: %d cells, median %.0f counts", nrow(x10), stats::median(x10$nCount_Xenium)))
-  p_both <- outl(outl(ggplot() + bg, crop$cells, "#00e5ff"), crop$cp_outlines, "#ffd400") + frame +
-    ggtitle("overlay: 10x (cyan) / cellpose (yellow)")
-  if (is.null(crop$cp_cells)) {
-    return((p_img | p_10x | p_both) + plot_annotation(title = title))
-  }
-  cp <- crop$cp_cells[inw(crop$cp_cells$x_um, crop$cp_cells$y_um), , drop = FALSE]
-  p_cp <- outl(ggplot() + bg, crop$cp_outlines, "#ffd400") + frame +
-    ggtitle(sprintf("cellpose: %d cells, median %.0f counts", nrow(cp), stats::median(cp$n_counts)))
-  (p_img | p_10x | p_cp | p_both) +
-    plot_annotation(title = title, subtitle = paste("cellpose source:", crop$meta$cellpose_source %||% "?"))
-}
-
-plot_inspection <- function(meta_slide, crop, win, title = "", point_size = 1.2) {
-  m <- crop$meta
-  img <- crop$image
-  lim <- stats::quantile(img, c(0.01, 0.997), na.rm = TRUE)
-  g <- pmin(pmax((img - lim[1]) / max(lim[2] - lim[1], 1), 0), 1)^0.6      # contrast stretch
-  ras <- grDevices::as.raster(g)
-  bg <- annotation_raster(ras, xmin = m$x0_um, xmax = m$x1_um, ymin = -m$y1_um, ymax = -m$y0_um)
-  frame <- list(coord_fixed(xlim = c(win$x0, win$x1), ylim = c(-win$y1, -win$y0), expand = FALSE),
-                theme_void(), theme(plot.title = element_text(size = 9)))
-
+## Two panels: where the window is on the slide | the cells of the window,
+## outlines (polygons file) and centroids coloured by QC result, FOV borders as
+## dashed lines. y is plotted as -y (image convention: y grows downwards).
+## polys = read_cosmx_polygons() of the slide, or NULL (centroids only).
+plot_inspection <- function(meta_slide, polys, win, title = "", point_size = 1.2) {
   cells <- meta_slide[meta_slide$x_um >= win$x0 - 20 & meta_slide$x_um <= win$x1 + 20 &
                         meta_slide$y_um >= win$y0 - 20 & meta_slide$y_um <= win$y1 + 20, ]
   cells$qc <- qc_reason(cells)
-
-  p_img <- ggplot() + bg + frame + ggtitle("morphology (DAPI)")
-
-  p_cells <- ggplot() + bg
-  if (!is.null(crop$nuclei) && nrow(crop$nuclei) > 0) {
-    p_cells <- p_cells + geom_polygon(data = crop$nuclei, aes(vertex_x, -vertex_y, group = cell_id),
-                                      fill = NA, colour = "white", linewidth = 0.15, alpha = 0.6)
-  }
-  if (!is.null(crop$cells) && nrow(crop$cells) > 0) {
-    b <- crop$cells
+  frame <- list(coord_fixed(xlim = c(win$x0, win$x1), ylim = c(-win$y1, -win$y0), expand = FALSE),
+                theme_void(), theme(plot.title = element_text(size = 9),
+                                    panel.background = element_rect(fill = "#101418", colour = NA)))
+  p_cells <- ggplot()
+  if (!is.null(polys)) {
+    b <- polys[polys$cell_id %in% cells$cell_id, ]
     b$qc <- cells$qc[match(b$cell_id, cells$cell_id)]
-    b <- b[!is.na(b$qc), ]
-    p_cells <- p_cells + geom_polygon(data = b, aes(vertex_x, -vertex_y, group = cell_id, colour = qc),
-                                      fill = NA, linewidth = 0.35)
+    if (nrow(b) > 0) {
+      p_cells <- p_cells + geom_polygon(data = b, aes(vertex_x, -vertex_y, group = cell_id, colour = qc),
+                                        fill = NA, linewidth = 0.35)
+    }
   }
+  ## FOV borders inside the window: where one FOV's cells end and the next begin
+  if ("fov" %in% colnames(meta_slide)) {
+    ext <- meta_slide |> group_by(fov) |>
+      summarise(x0 = min(x_um), x1 = max(x_um), y0 = min(y_um), y1 = max(y_um), .groups = "drop")
+    p_cells <- p_cells + geom_rect(data = ext, aes(xmin = x0, xmax = x1, ymin = -y1, ymax = -y0),
+                                   fill = NA, colour = "grey60", linetype = 2, linewidth = 0.2)
+  }
+  inw <- cells$x_um >= win$x0 & cells$x_um <= win$x1 & cells$y_um >= win$y0 & cells$y_um <= win$y1
   p_cells <- p_cells +
     geom_point(data = cells, aes(x_um, -y_um, colour = qc), size = point_size) +
     scale_colour_manual(values = QC_REASON_COLORS, drop = FALSE, name = "cell QC") +
-    frame + ggtitle({
-      inw <- cells$x_um >= win$x0 & cells$x_um <= win$x1 & cells$y_um >= win$y0 & cells$y_um <= win$y1
-      sprintf("cells in window: %d pass, %d fail (outlines = segmentation)",
-              sum(cells$qc[inw] == "pass"), sum(cells$qc[inw] != "pass"))
-    })
+    frame + ggtitle(sprintf("cells in window: %d pass, %d fail (%s; dashed = FOV extent)",
+                            sum(cells$qc[inw] == "pass"), sum(cells$qc[inw] != "pass"),
+                            if (is.null(polys)) "centroids only, no polygons file" else "outlines = segmentation"))
 
   ov <- meta_slide[sample(nrow(meta_slide), min(nrow(meta_slide), 1e5)), ]
   p_where <- ggplot(ov, aes(x_um, -y_um)) +
@@ -970,54 +1190,5 @@ plot_inspection <- function(meta_slide, crop, win, title = "", point_size = 1.2)
     annotate("rect", xmin = win$x0, xmax = win$x1, ymin = -win$y1, ymax = -win$y0,
              fill = NA, colour = "#e34948", linewidth = 0.8) +
     coord_fixed() + theme_void() + ggtitle("window position")
-
-  row1 <- (p_where | p_img | p_cells) + plot_layout(widths = c(1, 1.4, 1.4))
-  if (is.null(crop$cp_cells)) return(row1 + plot_annotation(title = title))
-
-  ## Row 2: the same window segmented by cellpose (03a settings), same QC rules
-  inw <- function(d) d$x_um >= win$x0 & d$x_um <= win$x1 & d$y_um >= win$y0 & d$y_um <= win$y1
-  cp <- crop$cp_cells
-  cp$qc <- factor(cp$qc_reason, levels = levels(cells$qc))
-  p_cp <- ggplot() + bg
-  if (!is.null(crop$cp_nuclei) && nrow(crop$cp_nuclei) > 0) {
-    p_cp <- p_cp + geom_polygon(data = crop$cp_nuclei, aes(vertex_x, -vertex_y, group = cell_id),
-                                fill = NA, colour = "white", linewidth = 0.15, alpha = 0.6)
-  }
-  if (!is.null(crop$cp_outlines) && nrow(crop$cp_outlines) > 0) {
-    b <- crop$cp_outlines
-    b$qc <- cp$qc[match(b$cell_id, cp$cell_id)]
-    p_cp <- p_cp + geom_polygon(data = b[!is.na(b$qc), ], aes(vertex_x, -vertex_y, group = cell_id, colour = qc),
-                                fill = NA, linewidth = 0.35)
-  }
-  p_cp <- p_cp + geom_point(data = cp, aes(x_um, -y_um, colour = qc), size = point_size) +
-    scale_colour_manual(values = QC_REASON_COLORS, drop = FALSE, name = "cell QC") + frame +
-    ggtitle(sprintf("cellpose (%s): %d pass, %d fail", crop$meta$cellpose_source %||% crop$meta$cellpose_mode,
-                    sum(cp$qc[inw(cp)] == "pass"), sum(cp$qc[inw(cp)] != "pass")))
-
-  ## overlay of both segmentations on the image: where do they disagree?
-  p_both <- ggplot() + bg
-  if (!is.null(crop$cells) && nrow(crop$cells) > 0) {
-    p_both <- p_both + geom_polygon(data = crop$cells, aes(vertex_x, -vertex_y, group = cell_id, colour = "10x"),
-                                    fill = NA, linewidth = 0.3)
-  }
-  if (!is.null(crop$cp_outlines) && nrow(crop$cp_outlines) > 0) {
-    p_both <- p_both + geom_polygon(data = crop$cp_outlines, aes(vertex_x, -vertex_y, group = cell_id,
-                                                                 colour = "cellpose"), fill = NA, linewidth = 0.3)
-  }
-  p_both <- p_both + scale_colour_manual(values = c(`10x` = "#00e5ff", cellpose = "#ffd400"), name = "outlines") +
-    frame + ggtitle("10x (cyan) vs cellpose (yellow) outlines")
-
-  ## numbers: cells in the window per QC result, both segmentations
-  q10 <- as.character(cells$qc[inw(cells)]); qcp <- as.character(cp$qc[inw(cp)])
-  tab <- data.frame(method = c(rep("10x", length(q10)), rep("cellpose", length(qcp))), qc = c(q10, qcp))
-  tab$qc <- factor(tab$qc, levels = levels(cells$qc))
-  tab$method <- factor(tab$method, levels = c("10x", "cellpose"))
-  p_tab <- ggplot(tab, aes(method, fill = qc)) + geom_bar() + scale_x_discrete(drop = FALSE) +
-    scale_fill_manual(values = QC_REASON_COLORS, drop = FALSE, guide = "none") +
-    theme_minimal(base_size = 9) + labs(x = NULL, y = "cells in window") +
-    ggtitle(sprintf("median counts/cell: 10x %.0f, cellpose %.0f",
-                    stats::median(cells$nCount_Xenium[inw(cells)]), stats::median(cp$n_counts[inw(cp)])))
-
-  row2 <- (p_tab | p_both | p_cp) + plot_layout(widths = c(1, 1.4, 1.4))
-  (row1 / row2) + plot_annotation(title = title)
+  (p_where | p_cells) + plot_layout(widths = c(1, 1.6)) + plot_annotation(title = title)
 }

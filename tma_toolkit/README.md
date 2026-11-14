@@ -2,9 +2,10 @@
 
 A Python toolkit for large TMAs, such as the next 200-core dataset. It builds one AnnData
 for all slides with one row of metadata per core. You can then select cores by any
-metadata, save those selections, and compare cores or groups of cores. It works on Xenium
-output, and on cellpose/segger segmentations written in the same 10x layout
-(`experiment1_tma` 03a/03b).
+metadata, save those selections, and compare cores or groups of cores. It reads **CosMx flat
+files** (`slides.csv` with a `cosmx_dir` column: `*_exprMat_file.csv.gz` + `*_metadata_file.csv.gz`
+per slide; negative probes and system controls are kept as `n_ctrl_probe` / `n_ctrl_codeword`),
+**Xenium** output (`xenium_dir` column), and any other segmentation written in the 10x layout.
 
 ```
 pip install -e tma_toolkit            # + [de] for pydeseq2, [analysis] for scanpy/squidpy

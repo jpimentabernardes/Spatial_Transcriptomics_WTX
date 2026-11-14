@@ -14,16 +14,16 @@
 ## set CHECKPOINT_LABEL_COL in config.R to force one.
 ##
 ## A cell is "positive" for a gene at >= CHECKPOINT_MIN_COUNTS transcripts (default 1).
-## One transcript can be background or spill-over from a neighbour (see 03c MECR / 03f);
+## One transcript can be background or spill-over from a neighbour (see 03 MECR);
 ## set 2 for a stricter call -- the counts are in the table, so you can re-threshold.
 ##
-## INPUT : xenium_<seg>_annotated.rds (04, ideally after 04c), config/compartments.csv
+## INPUT : cosmx_<seg>_annotated.rds (04, ideally after 04c), config/compartments.csv
 ## OUTPUT: data/export/05c_punch_file_<NTA|MTA>_<seg>.csv     ONE ROW PER CORE (patient): per marker
 ##           (PD1, PDL1, CD56, CD8 = CD8A + CD8B, CD8A, CD8B) transcripts and transcripts per cell,
 ##           for all cells and per compartment (EpiTumour, MacDC, T) -- section 3b
 ##         data/export/05c_checkpoint_cells_<slide>.csv.gz    one row per cell (in a core):
 ##           cell, slide_id, is_tumour, core_id, organ, site, x_um, y_um, lineage, label,
-##           compartment, nCount_Xenium, <gene> (counts), <gene>_norm (log-normalised)
+##           compartment, nCount_CosMx, <gene> (counts), <gene>_norm (log-normalised)
 ##         tables/05c_checkpoint_by_core_compartment.csv   per core x compartment:
 ##           n_cells, pct positive, mean counts, mean normalised expression per gene
 ##         tables/05c_checkpoint_by_site_compartment.csv   per site x normal/tumour x compartment
@@ -61,17 +61,17 @@ COMP_COLOURS <- c("Epithelial/Tumour" = "#418ED0", "T cells" = "#C0392B", "Macro
                   "NK/ILC" = "#8E44AD", "B/Plasma" = "#16A085", "Other immune" = "#C17743",
                   "Stroma" = "#7F8C8D", "Other" = "#BDBDBD")
 
-xen <- readRDS(obj_path("annotated"))
-if (!all(c("site", "is_tumour") %in% colnames(xen[[]]))) xen <- add_site_and_tumour(xen, ANNOT_FAMILIES_CSV)
-genes <- match_case(CHECKPOINT_GENES, rownames(xen[["Xenium"]]))
+cmx <- readRDS(obj_path("annotated"))
+if (!all(c("site", "is_tumour") %in% colnames(cmx[[]]))) cmx <- add_site_and_tumour(cmx, ANNOT_FAMILIES_CSV)
+genes <- match_case(CHECKPOINT_GENES, rownames(cmx[["CosMx"]]))
 names(genes) <- names(CHECKPOINT_GENES)
-miss <- names(genes)[!genes %in% rownames(xen[["Xenium"]])]
+miss <- names(genes)[!genes %in% rownames(cmx[["CosMx"]])]
 if (length(miss)) message("Not on the panel (left out): ", paste(sprintf("%s (%s)", miss, genes[miss]), collapse = ", "))
 genes <- genes[!names(genes) %in% miss]
 if (!length(genes)) stop("None of the checkpoint genes is on the panel.")
 
 label_col <- CHECKPOINT_LABEL_COL %||%
-  (if ("cell_type_organ_all" %in% colnames(xen[[]])) "cell_type_organ_all" else "cell_type")
+  (if ("cell_type_organ_all" %in% colnames(cmx[[]])) "cell_type_organ_all" else "cell_type")
 message("Cell type labels from: ", label_col,
         if (label_col == "cell_type") "  (run 04c for organ-level immune / stroma labels)" else "")
 
@@ -79,7 +79,7 @@ message("Cell type labels from: ", label_col,
 ## 1. compartment per cell
 ## -----------------------------------------------------------------------
 rules <- read_config_csv(COMPARTMENTS_CSV, stringsAsFactors = FALSE)
-m <- xen[[]]
+m <- cmx[[]]
 m$label <- as.character(m[[label_col]])
 m$label[is.na(m$label)] <- as.character(m$cell_type[is.na(m$label)])
 m$compartment <- NA_character_
@@ -102,16 +102,16 @@ print(table(compartment = m$compartment, slide = m$slide_id))
 ## 2. per-cell export (cells in cores)
 ## -----------------------------------------------------------------------
 in_core <- !is.na(m$core_id)
-cnt <- GetAssayData(xen, assay = "Xenium", layer = "counts")[genes, , drop = FALSE]
-nrm <- if ("data" %in% Layers(xen[["Xenium"]])) GetAssayData(xen, assay = "Xenium", layer = "data")[genes, , drop = FALSE] else
-  log1p(sweep(cnt, 2, pmax(m$nCount_Xenium, 1), "/") * stats::median(m$nCount_Xenium))
+cnt <- GetAssayData(cmx, assay = "CosMx", layer = "counts")[genes, , drop = FALSE]
+nrm <- if ("data" %in% Layers(cmx[["CosMx"]])) GetAssayData(cmx, assay = "CosMx", layer = "data")[genes, , drop = FALSE] else
+  log1p(sweep(cnt, 2, pmax(m$nCount_CosMx, 1), "/") * stats::median(m$nCount_CosMx))
 cnt <- as.matrix(Matrix::t(cnt)); colnames(cnt) <- names(genes)
 nrm <- round(as.matrix(Matrix::t(nrm)), 4); colnames(nrm) <- paste0(names(genes), "_norm")
 if (!"patient_id" %in% colnames(m)) m$patient_id <- NA
 cells <- data.frame(cell = rownames(m), slide_id = m$slide_id, is_tumour = m$is_tumour, core_id = m$core_id,
                     patient_id = m$patient_id, organ = m$organ, site = m$site, x_um = round(m$x_um, 2), y_um = round(m$y_um, 2),
                     lineage = m$lineage, label = m$label, compartment = m$compartment,
-                    nCount_Xenium = m$nCount_Xenium, cnt, nrm, check.names = FALSE)[in_core, ]
+                    nCount_CosMx = m$nCount_CosMx, cnt, nrm, check.names = FALSE)[in_core, ]
 for (sid in unique(cells$slide_id)) {
   f <- file.path(EXPORT_DIR, sprintf("05c_checkpoint_cells_%s_%s.csv.gz", SEGMENTATION, sid))
   d <- cells[cells$slide_id == sid, ]
@@ -179,7 +179,7 @@ add_block <- function(tab, sel, suffix) {
     s[rownames(r), ] <- r
   }
   tab[[paste0("n_cells", suffix)]] <- as.integer(n)
-  if (suffix == "") tab$total_transcripts <- as.numeric(rowsum(cells$nCount_Xenium, factor(key, levels = rownames(tab)))[rownames(tab), 1])
+  if (suffix == "") tab$total_transcripts <- as.numeric(rowsum(cells$nCount_CosMx, factor(key, levels = rownames(tab)))[rownames(tab), 1])
   for (mk in colnames(pm)) {
     tab[[paste0(mk, "_transcripts", suffix)]] <- s[, mk]
     tab[[paste0(mk, "_per_cell", suffix)]] <- round(ifelse(n > 0, s[, mk] / n, NA), 5)

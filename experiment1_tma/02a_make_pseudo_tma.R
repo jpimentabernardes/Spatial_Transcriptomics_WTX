@@ -22,16 +22,16 @@
 ## then run 02_tma_dearray.R as usual: it finds core_selections/ and uses
 ## polygon mode. Edit the generated tma_map.csv freely (patient, organ, ...).
 ##
-## INPUT : xenium_<seg>_raw.rds (01)
+## INPUT : cosmx_<seg>_raw.rds (01)
 ## OUTPUT: the files above + figures/02a_pseudo_tma_<slide>.png
 ## =============================================================================
 
 source("config/config.R")
 source("R/helpers.R")
 
-xen <- readRDS(obj_path("raw"))
+cmx <- readRDS(obj_path("raw"))
 slides <- read_slides()
-meta <- xen[[]]
+meta <- cmx[[]]
 pseudo_slides <- if (is.null(PSEUDO_TMA_SLIDES)) slides$slide_id else PSEUDO_TMA_SLIDES
 
 r <- PSEUDO_CORE_DIAMETER_UM / 2

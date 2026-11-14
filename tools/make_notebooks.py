@@ -35,11 +35,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # script -> folder the notebook goes to (both relative to the repo root)
 SCRIPTS = [
-    ("experiment1_tma/03a_segment_cellpose.py", "experiment1_tma/notebooks"),
-    ("experiment1_tma/03b_segment_segger.py", "experiment1_tma/notebooks"),
-    ("experiment1_tma/03b_segger_to_common.py", "experiment1_tma/notebooks"),
-    ("experiment1_tma/03d_segger_priors.py", "experiment1_tma/notebooks"),
-    ("experiment1_tma/07_register_modalities.py", "experiment1_tma/notebooks"),
+    ("experiment1_tma/07_register_he.py", "experiment1_tma/notebooks"),
     ("tma_toolkit/scripts/make_core_metadata_template.py", "tma_toolkit/notebooks"),
     ("tma_toolkit/scripts/build_tma_object.py", "tma_toolkit/notebooks"),
     ("tma_toolkit/examples/core_selection_walkthrough.py", "tma_toolkit/notebooks"),
@@ -51,11 +47,7 @@ BASE = {"numpy": "numpy", "pandas": "pandas", "scipy": "scipy", "pyarrow": "pyar
 IMG = {**BASE, "tifffile": "tifffile", "zarr": "zarr", "imagecodecs": "imagecodecs", "skimage": "scikit-image",
        "matplotlib": "matplotlib"}
 PACKAGES = {
-    "experiment1_tma/03a_segment_cellpose.py": {**IMG, "cellpose": "cellpose"},
-    "experiment1_tma/03b_segment_segger.py": {**BASE},            # segger itself runs in its pixi env
-    "experiment1_tma/03b_segger_to_common.py": {**BASE},          # + geopandas only with boundaries
-    "experiment1_tma/03d_segger_priors.py": {**BASE, "skimage": "scikit-image"},
-    "experiment1_tma/07_register_modalities.py": {**IMG, "SimpleITK": "SimpleITK"},
+    "experiment1_tma/07_register_he.py": {"numpy": "numpy", "pandas": "pandas", "matplotlib": "matplotlib"},
     "tma_toolkit/scripts/make_core_metadata_template.py": {**BASE},
     "tma_toolkit/scripts/build_tma_object.py": {**BASE, "anndata": "anndata", "sklearn": "scikit-learn",
                                                 "h5py": "h5py", "matplotlib": "matplotlib"},
@@ -65,11 +57,7 @@ PACKAGES = {
 IMAGING = ("exp1-imaging", "experiment1_tma/env/py_imaging.yml")
 TOOLKIT = ("exp1-imaging", "experiment1_tma/env/py_imaging.yml + pip install -e tma_toolkit")
 ENVS = {
-    "experiment1_tma/03a_segment_cellpose.py": IMAGING,
-    "experiment1_tma/03b_segment_segger.py": IMAGING,
-    "experiment1_tma/03b_segger_to_common.py": IMAGING,
-    "experiment1_tma/03d_segger_priors.py": IMAGING,
-    "experiment1_tma/07_register_modalities.py": IMAGING,
+    "experiment1_tma/07_register_he.py": IMAGING,
     "tma_toolkit/scripts/make_core_metadata_template.py": TOOLKIT,
     "tma_toolkit/scripts/build_tma_object.py": TOOLKIT,
 }

@@ -1,5 +1,6 @@
-# Segmentation (03a, 06a) + registration (07). GPU node recommended for cellpose.
+# Python side of experiment1_tma: 07_register_he.py and the tma_toolkit package.
 #   conda env create -f env/py_imaging.yml && conda activate exp1-imaging
+#   pip install -e ../tma_toolkit            # optional: the AnnData toolkit
 # Notebooks: register the environment as a Jupyter kernel once, then pick
 # "exp1-imaging" as the kernel (Kernel > Change kernel):
 #   python -m ipykernel install --user --name exp1-imaging --display-name exp1-imaging
@@ -9,17 +10,12 @@ channels:
 dependencies:
   - python=3.11
   - numpy
-  - pandas
+  - pandas>=2,<3      # tma_toolkit is written for pandas 2
   - scipy
   - pyarrow
-  - scikit-image
   - matplotlib
-  - tifffile>=2025.5  # region reads of image pyramids through tifffile's zarr store
-  - imagecodecs
-  - zarr>=3
-  - simpleitk
-  - geopandas         # reading segger boundary GeoParquet (03b)
+  - anndata
+  - scikit-learn
+  - h5py
   - ipykernel        # so Jupyter can run the notebooks in this environment
   - pip
-  - pip:
-      - cellpose      # v4 (Cellpose-SAM) or v3 both supported by 03a/06a

@@ -2,20 +2,28 @@
 ## 05_tma_first_insights.R
 ##
 ## First insights from the multi-organ / multi-tumour TMAs, organised by aim.
+## Same analyses as the Xenium project's 05, now on the whole transcriptome --
+## so every table here has a Xenium counterpart to put next to it (10 does the
+## formal platform comparison).
 ##
-## AIM 1 -- probe specificity: are the colon + custom probes gut-specific, or
-##          do the immune targets generalise to other organs?
-##   1.1 Signal over background per gene x core (vs negative-control probes).
-##       "Detected" = clearly above the non-binding-probe rate in that core.
+## AIM 1 -- detection and specificity: which genes are measured above
+##          background in which organ, and do the immune targets behave the
+##          same in every organ?
+##   1.1 Signal over background per gene x core (vs negative probes).
+##       "Detected" = clearly above the negative-probe rate in that core.
+##       On the whole transcriptome MOST genes are not expressed in a given
+##       tissue, so "% of the panel detected" is expected to be far below the
+##       Xenium figure: the Xenium panel was designed for genes that are there.
+##       The table therefore also reports the genes of the Xenium panel
+##       separately (in_xenium_panel; config/xenium_panel_genes.csv, written by 10).
 ##   1.2 Organ specificity (tau) -- computed twice: on all cells AND within
-##       immune cells only. An immune probe with high tau on all cells but low
+##       immune cells only. An immune gene with high tau on all cells but low
 ##       tau within immune cells is NOT organ-specific; organs just differ in
-##       how many immune cells they contain. Separating these two is the key
-##       step for answering Aim 1 honestly.
-##   1.3 Lineage specificity: does an immune probe's signal land in immune
+##       how many immune cells they contain.
+##   1.3 Lineage specificity: does an immune gene's signal land in immune
 ##       cells in every organ, or does it appear in epithelium/stroma in some
 ##       organs (non-specific binding, or segmentation spill-over -> compare
-##       with MECR in 03c)?
+##       with MECR in 03)?
 ##   1.4 Generalisability: is the immune-target profile of e.g. T cells in
 ##       lung the same as in colon (correlation between organs per cell type)?
 ##
@@ -32,16 +40,16 @@
 ## Statistical unit = CORE (or patient), never cell. Millions of cells give
 ## tiny p-values for trivial differences; cores/patients are the replicates.
 ##
-## INPUT : xenium_<seg>_annotated.rds (04), config/probe_expectations.csv
-## OUTPUT: tables/05_*.csv, figures/05_*.png, xenium_<seg>_insights.rds
+## INPUT : cosmx_<seg>_annotated.rds (04), config/probe_expectations.csv
+## OUTPUT: tables/05_*.csv, figures/05_*.png, cosmx_<seg>_insights.rds
 ## =============================================================================
 
 source("config/config.R")
 source("R/helpers.R")
 
-xen <- readRDS(obj_path("annotated"))
-counts <- GetAssayData(xen, assay = "Xenium", layer = "counts")
-meta <- xen[[]]
+cmx <- readRDS(obj_path("annotated"))
+counts <- GetAssayData(cmx, assay = "CosMx", layer = "counts")
+meta <- cmx[[]]
 genes <- rownames(counts)
 
 probes <- read_config_csv(PROBE_EXPECT_CSV, stringsAsFactors = FALSE)
@@ -51,6 +59,15 @@ if (length(missing_probes) > 0) message("In probe_expectations.csv but not on pa
 probes <- probes[probes$gene %in% genes, ]
 immune_targets <- probes$gene[probes$category == "immune_target"]
 custom_genes <- probes$gene[probes$panel == "custom"]
+## Genes of the Xenium panel (optional): one column `gene`. 10 writes this file
+## from the Xenium object; you can also list the panel by hand.
+xenium_panel <- if (file.exists(XENIUM_PANEL_CSV)) {
+  g <- read_config_csv(XENIUM_PANEL_CSV, stringsAsFactors = FALSE)
+  intersect(match_case(as_seurat_features(g[[if ("cosmx_gene" %in% colnames(g)) "cosmx_gene" else "gene"]]), genes), genes)
+} else character(0)
+gene_set <- function(g) ifelse(g %in% custom_genes, "custom",
+                               ifelse(g %in% xenium_panel, "xenium_panel", "wtx_only"))
+if (length(xenium_panel) == 0) message("No ", basename(XENIUM_PANEL_CSV), " yet (10 writes it): all genes are labelled wtx_only.")
 
 core_info <- meta |>
   distinct(core_id, slide_id, patient_id, organ, tissue_type, diagnosis, location) |>
@@ -67,8 +84,10 @@ rownames(core_info) <- core_info$core_id
 ##     non-binding probe collects here (autofluorescence, off-target
 ##     hybridisation, mis-decoding). Background differs a lot between organs
 ##     (e.g. autofluorescent lung/liver), so it must be per core, not global.
-##     CAVEAT: gene probe sets and control probes are not identical in probe
-##     number/design, so treat SBR as a ranking, not an absolute FDR.
+##     CAVEAT: gene probes and negative probes are not identical in design,
+##     so treat SBR as a ranking, not an absolute FDR.
+##     The gene x core table has ~19,000 x n_cores rows: it is written
+##     compressed (tables/05_aim1_sbr_gene_by_core.csv.gz).
 ## -----------------------------------------------------------------------
 ctrl_col <- if ("nCount_ControlProbe" %in% colnames(meta)) "ControlProbe" else "ControlCodeword"
 message("Background model uses: ", ctrl_col)
@@ -89,8 +108,9 @@ sbr$p <- stats::ppois(sbr$counts - 1, sbr$lambda, lower.tail = FALSE)
 sbr$padj <- stats::p.adjust(sbr$p, method = "BH")
 sbr$detected <- sbr$log2_sbr >= SBR_LOG2_MIN & sbr$padj < SBR_PADJ_MAX
 sbr <- cbind(sbr, core_info[sbr$core_id, c("slide_id", "patient_id", "organ", "tissue_type")])
-sbr$panel <- ifelse(sbr$gene %in% custom_genes, "custom", "colon")
-save_table(sbr, "05_aim1_sbr_gene_by_core")
+sbr$panel <- gene_set(sbr$gene)
+data.table::fwrite(sbr, file.path(TABLES_DIR, "05_aim1_sbr_gene_by_core.csv.gz"))
+message("Saved table  -> ", file.path(TABLES_DIR, "05_aim1_sbr_gene_by_core.csv.gz"))
 
 sbr_organ <- sbr |>
   group_by(gene, panel, organ) |>
@@ -104,8 +124,9 @@ p_det <- sbr_organ |>
   summarise(pct_genes_detected = 100 * mean(frac_cores_detected >= 0.5), .groups = "drop") |>
   ggplot(aes(organ, pct_genes_detected, fill = panel)) +
   geom_col(position = "dodge") + theme_bw() +
-  labs(y = "% of panel genes above background in >= half the cores",
-       title = "Aim 1: fraction of the panel that 'works' per organ")
+  labs(y = "% of genes above background in >= half the cores", fill = "gene set",
+       title = "Aim 1: genes detected above the negative-probe background per organ",
+       subtitle = "wtx_only = genes not on the Xenium panel: most of the transcriptome is silent in any one tissue")
 save_fig(p_det, "05_aim1_pct_genes_detected_by_organ", width = 10, height = 5)
 
 focus <- unique(c(immune_targets, custom_genes))
@@ -133,8 +154,8 @@ organ_mean_cpm <- function(cells) {
   org <- core_info[colnames(cpm), "organ"]
   sapply(split(colnames(cpm), org), function(cc) rowMeans(cpm[, cc, drop = FALSE]))
 }
-cpm_all <- organ_mean_cpm(colnames(xen))
-imm_cells <- colnames(xen)[meta$lineage == "Immune"]
+cpm_all <- organ_mean_cpm(colnames(cmx))
+imm_cells <- colnames(cmx)[meta$lineage == "Immune"]
 cpm_imm <- if (length(imm_cells) > 100) organ_mean_cpm(imm_cells) else NULL
 
 tau_tab <- data.frame(gene = genes, tau_all = apply(cpm_all, 1, tau_index))
@@ -143,13 +164,16 @@ if (!is.null(cpm_imm)) {
   tau_tab$tau_immune <- apply(cpm_imm, 1, tau_index)
   tau_tab$top_organ_immune <- colnames(cpm_imm)[apply(cpm_imm, 1, which.max)]
 }
-tau_tab$panel <- ifelse(tau_tab$gene %in% custom_genes, "custom", "colon")
+tau_tab$panel <- gene_set(tau_tab$gene)
 tau_tab$immune_target <- tau_tab$gene %in% immune_targets
 save_table(tau_tab, "05_aim1_organ_specificity_tau")
 
 if (!is.null(cpm_imm)) {
   lab <-tau_tab[tau_tab$immune_target | tau_tab$panel == "custom", ]
-  p_tau <- ggplot(tau_tab, aes(tau_all, tau_immune)) +
+  ## plot the Xenium-panel / custom / immune-target genes: 19,000 dots hide the message
+  tau_plot <- tau_tab[tau_tab$panel != "wtx_only" | tau_tab$immune_target, ]
+  if (nrow(tau_plot) == 0) tau_plot <- tau_tab
+  p_tau <- ggplot(tau_plot, aes(tau_all, tau_immune)) +
     geom_abline(linetype = 2, color = "grey50") +
     geom_point(aes(color = panel, shape = immune_target), alpha = 0.7) +
     geom_text(data = lab, aes(label = gene), size = 2.5, vjust = -0.6) +
@@ -171,7 +195,7 @@ if (!is.null(cpm_imm)) {
 ## -----------------------------------------------------------------------
 lin_probes <- probes[!is.na(probes$expected_lineage) & nzchar(probes$expected_lineage), ]
 if (nrow(lin_probes) > 0) {
-  tot_by_cell <- meta$nCount_Xenium
+  tot_by_cell <- meta$nCount_CosMx
   ctrl_per_cell <- meta[[paste0("nCount_", ctrl_col)]] / meta[[paste0("nFeatTotal_", ctrl_col)]]
   lin_spec <- dplyr::bind_rows(lapply(split(seq_len(nrow(meta)), meta$organ), function(idx) {
     org <- meta$organ[idx[1]]
@@ -207,10 +231,10 @@ if (nrow(lin_probes) > 0) {
 ##     targets, then correlate organs. High correlation = the probes read out
 ##     the same cell type the same way everywhere.
 ## -----------------------------------------------------------------------
-gen_genes <- if (length(immune_targets) >= 3) immune_targets else genes
+gen_genes <- if (length(immune_targets) >= 3) immune_targets else if (length(xenium_panel) >= 3) xenium_panel else genes
 imm_types <- setdiff(unique(meta$cell_type[meta$lineage == "Immune"]), NA)
 gen_tab <- dplyr::bind_rows(lapply(imm_types, function(ct) {
-  cells <- colnames(xen)[meta$cell_type == ct]
+  cells <- colnames(cmx)[meta$cell_type == ct]
   org <- meta[cells, "organ"]
   ok_org <- names(which(table(org) >= MIN_CELLS_PSEUDOBULK))
   if (length(ok_org) < 2) return(NULL)
@@ -233,8 +257,10 @@ if (nrow(gen_tab) > 0) {
 }
 
 if (length(immune_targets) > 0 && length(imm_cells) > 0) {
-  sub_imm <- CreateSeuratObject(counts = counts[, imm_cells], assay = "Xenium", meta.data = meta[imm_cells, ])
-  sub_imm <- NormalizeData(sub_imm, scale.factor = median(xen$nCount_Xenium), verbose = FALSE)
+  sub_imm <- CreateSeuratObject(counts = counts[immune_targets, imm_cells, drop = FALSE], assay = "CosMx", meta.data = meta[imm_cells, ])
+  ## normalised by the cell's TOTAL counts (all genes), as in 04
+  sub_imm <- SetAssayData(sub_imm, layer = "data", new.data = methods::as(log1p(Matrix::t(Matrix::t(
+    counts[immune_targets, imm_cells, drop = FALSE]) / pmax(meta[imm_cells, "nCount_CosMx"], 1)) * median(cmx$nCount_CosMx)), "CsparseMatrix"))
   sub_imm$type_organ <- paste(sub_imm$cell_type, sub_imm$organ, sep = " | ")
   p_dot_imm <- marker_dotplot(sub_imm, features = immune_targets, group.by = "type_organ") +
     RotatedAxis() + ggtitle("Aim 1: immune targets within immune cell types, split by organ")
@@ -309,7 +335,10 @@ saveRDS(list(counts = pb, meta = pb_meta), file.path(PROCESSED_DIR, "05_pseudobu
 
 vp_terms <- c("cell_type", "organ", "patient_id", "slide_id", "location", "tissue_type")
 vp_terms <- vp_terms[vapply(vp_terms, function(v) length(unique(stats::na.omit(pb_meta[[v]]))) > 1, logical(1))]
-vp_genes <- if (length(immune_targets) >= 3) unique(c(immune_targets, custom_genes)) else rownames(lcpm)
+## whole transcriptome: variance partitioning of every gene takes hours and most
+## genes are noise -- immune targets + custom genes, else the variable genes of 04
+vp_genes <- if (length(immune_targets) >= 3) unique(c(immune_targets, custom_genes)) else
+  intersect(if (length(VariableFeatures(cmx)) > 0) VariableFeatures(cmx) else rownames(lcpm), rownames(lcpm))
 if (requireNamespace("variancePartition", quietly = TRUE) && length(vp_terms) >= 2) {
   pbm <- pb_meta
   for (v in vp_terms) pbm[[v]] <- ifelse(is.na(pbm[[v]]) | pbm[[v]] == "", "NA", as.character(pbm[[v]]))
@@ -333,7 +362,11 @@ if (requireNamespace("variancePartition", quietly = TRUE) && length(vp_terms) >=
 ## -----------------------------------------------------------------------
 ## 2.3 Core-to-core similarity (whole-core pseudobulk, and immune-only)
 ## -----------------------------------------------------------------------
-core_lcpm <- edgeR::cpm(as.matrix(pb_core), log = TRUE, prior.count = 1)
+## on the genes used for clustering in 04 (variable + marker genes): thousands of
+## silent genes would only add ties and noise to a rank correlation
+sim_genes <- intersect(VariableFeatures(cmx), rownames(pb_core))
+if (length(sim_genes) < 50) sim_genes <- rownames(pb_core)
+core_lcpm <- edgeR::cpm(as.matrix(pb_core), log = TRUE, prior.count = 1)[sim_genes, , drop = FALSE]
 cc <- stats::cor(core_lcpm, method = "spearman")
 ann <- core_info[colnames(cc), c("organ", "patient_id", "slide_id")]
 if (requireNamespace("pheatmap", quietly = TRUE)) {
@@ -386,8 +419,10 @@ for (org in unique(pb_meta$organ)) {
     ## than one location (paired design); otherwise patient is nested in location.
     block <- d$patient_id
     use_block <- any(tapply(d$location, block, function(v) length(unique(v))) > 1)
+    corfit <- if (use_block) tryCatch(limma::duplicateCorrelation(v, design, block = block), error = function(e) NULL)
+    ## too few paired cores: the within-patient correlation cannot be estimated -> no blocking
+    use_block <- use_block && !is.null(corfit) && is.finite(corfit$consensus) && abs(corfit$consensus) < 0.99
     fit <- if (use_block) {
-      corfit <- limma::duplicateCorrelation(v, design, block = block)
       limma::lmFit(v, design, block = block, correlation = corfit$consensus)
     } else limma::lmFit(v, design)
     locs <- colnames(design)
@@ -418,8 +453,8 @@ for (cid in unique(meta$core_id)) {
   for (t in seq_along(types)) nbhd[idx, t] <- rowMeans(lab == t)
 }
 km <- stats::kmeans(nbhd, centers = N_NICHES, nstart = 5, iter.max = 50)
-xen$niche <- paste0("N", km$cluster)
-meta$niche <- xen$niche
+cmx$niche <- paste0("N", km$cluster)
+meta$niche <- cmx$niche
 niche_comp <- km$centers
 rownames(niche_comp) <- paste0("N", seq_len(N_NICHES))
 save_table(cbind(niche = rownames(niche_comp), as.data.frame(niche_comp)), "05_aim2_niche_composition")
@@ -435,5 +470,5 @@ p_niche <- ggplot(niche_by_organ, aes(core_id, frac, fill = niche)) +
   labs(title = "Aim 2: niche composition per core")
 save_fig(p_niche, "05_aim2_niches_per_core", width = 18, height = 6)
 
-saveRDS(xen, obj_path("insights"))
+saveRDS(cmx, obj_path("insights"))
 message("Saved -> ", obj_path("insights"))

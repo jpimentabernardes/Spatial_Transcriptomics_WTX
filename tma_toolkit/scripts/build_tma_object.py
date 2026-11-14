@@ -7,13 +7,15 @@
         --project-dir /work/Spatial_TMA \
         --out /work/Spatial_TMA/data/processed/tma.h5ad
 
-slides.csv          slide_id, xenium_dir [, row_flip, col_flip]  (paths relative to --project-dir)
+slides.csv          slide_id, cosmx_dir (CosMx flat files) or xenium_dir (Xenium outs) [, cosmx_prefix,
+                    row_flip, col_flip]  (paths relative to --project-dir)
 core_metadata.csv   one row per core (make it with make_core_metadata_template.py)
 Optional:
   --overrides        CSV slide_id, detected_core, core_row, core_col   (fix dearray labels)
-  --polygons-dir     <dir>/<slide_id>/<core_id>.csv with X,Y columns (um), e.g. Xenium Explorer
+  --polygons-dir     <dir>/<slide_id>/<core_id>.csv with X,Y columns (um, frame of obs x_um / y_um)
                      "Download selection coordinates" -- used instead of automatic dearraying
-  --segmentation     xenium | cellpose | segger (common 10x layout under data/segmentation/)
+  --segmentation     default: the platform of slides.csv (cosmx / xenium); any other name reads
+                     data/segmentation/<name>/<slide_id>/ in the common 10x layout
 
 Outputs: the .h5ad, <figures>/dearray_<slide>.png (CHECK THESE against the TMA map),
 <tables>/cores.csv, <tables>/core_qc_flags.csv.
@@ -47,7 +49,7 @@ def parse_args(argv=None):
     p.add_argument("--core-metadata", required=True)
     p.add_argument("--project-dir", default=".")
     p.add_argument("--out", required=True)
-    p.add_argument("--segmentation", default="xenium")
+    p.add_argument("--segmentation", default=None)
     p.add_argument("--overrides")
     p.add_argument("--polygons-dir")
     p.add_argument("--figures", default=None, help="default <project-dir>/figures")

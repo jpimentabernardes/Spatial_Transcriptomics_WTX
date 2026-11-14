@@ -1,9 +1,8 @@
 ## =============================================================================
 ## 05d_plot_gene_core.R
 ##
-## One gene in one core, fluorescence style: the real DAPI image (optionally + a
-## protein stain) on black, cells carrying the gene in yellow -> white (brighter =
-## more transcripts). EXP1_05D_STAIN=dapi | dapi+boundary | dapi+protein | none.
+## One gene in one core, fluorescence style: all cells as blue dots on black,
+## cells carrying the gene in yellow -> white (brighter = more transcripts).
 ##
 ## Run:   Rscript 05d_plot_gene_core.R NCAM1 "A 4F" TMA_TUMOR
 ##        Rscript 05d_plot_gene_core.R NCAM1 A_4-f            (slide optional)
@@ -11,7 +10,7 @@
 ## 02 kept them, core_name / cellscape_core (A 4F = A_4f = A_4-f = a4f). If it is not
 ## found, the cores of the slide are listed.
 ##
-## INPUT : xenium_<seg>_annotated.rds (or _cores.rds if there is no annotated object)
+## INPUT : cosmx_<seg>_annotated.rds (or _cores.rds if there is no annotated object)
 ## OUTPUT: figures/05d_<gene>_<core>.png  (and _zoom.png: the ZOOM_UM window with most positive cells)
 ## Dot size / zoom: EXP1_05D_DOT=0.4 (smaller dots), EXP1_05D_ZOOM_UM=800 (wider zoom)
 ## =============================================================================
@@ -28,8 +27,8 @@ ZOOM_UM   <- as.numeric(Sys.getenv("EXP1_05D_ZOOM_UM", "600"))  # side of the zo
 
 f <- obj_path("annotated"); if (!file.exists(f)) f <- obj_path("cores")
 message("Object: ", f)
-xen <- readRDS(f)
-m <- xen[[]]
+cmx <- readRDS(f)
+m <- cmx[[]]
 m <- m[!is.na(m$core_id), ]
 if (!is.na(SLIDE)) m <- m[m$slide_id == SLIDE, ]
 norm <- function(x) tolower(gsub("[^[:alnum:]]", "", as.character(x)))
@@ -52,66 +51,21 @@ if (sum(hit) != 1) {
        paste(utils::capture.output(print(show, row.names = FALSE)), collapse = "\n"), call. = FALSE)
 }
 cid <- alias$core_id[hit]
-g <- match_case(GENE, rownames(xen[["Xenium"]]))
-if (!g %in% rownames(xen[["Xenium"]])) stop(GENE, " is not on the panel.")
+g <- match_case(GENE, rownames(cmx[["CosMx"]]))
+if (!g %in% rownames(cmx[["CosMx"]])) stop(GENE, " is not on the panel.")
 d <- m[m$core_id == cid, ]
-d$expr <- as.numeric(GetAssayData(xen, assay = "Xenium", layer = "counts")[g, rownames(d)])
-rm(xen); invisible(gc())
+d$expr <- as.numeric(GetAssayData(cmx, assay = "CosMx", layer = "counts")[g, rownames(d)])
+rm(cmx); invisible(gc())
 message(sprintf("%s in core %s (%s): %d of %d cells positive, %d transcripts", g, cid, d$slide_id[1],
                 sum(d$expr > 0), nrow(d), sum(d$expr)))
 
 ## ---------------------------------------------------------------------------
-## background: the Xenium morphology image (EXP1_05D_STAIN)
-##   dapi            DAPI in blue (default)
-##   dapi+boundary   + cell-boundary stain (ATP1A1 / CD45 / E-cadherin) in grey
-##   dapi+protein    + interior protein stain (aSMA / vimentin) in grey
-##   none            no image: every cell drawn as a blue dot (as before)
-## The image is cut with py/crop_region.py (PYTHON_BIN, needs tifffile + zarr: the
-## exp1-imaging environment). Xenium folder from config/slides.csv, or EXP1_05D_XENIUM_DIR.
+## background: every cell as a blue dot. (The Xenium version of this script drew
+## the DAPI image instead; the CosMx flat files contain no slide image -- the
+## stains are only in the raw export, CellStatsDir/Morphology2D, one file per FOV.)
 ## ---------------------------------------------------------------------------
-STAIN <- tolower(Sys.getenv("EXP1_05D_STAIN", "dapi"))
-xdir <- Sys.getenv("EXP1_05D_XENIUM_DIR", "")
-if (!nzchar(xdir) && STAIN != "none") {
-  sl <- read_slides()
-  xdir <- if (d$slide_id[1] %in% sl$slide_id) resolve_path(sl$xenium_dir[sl$slide_id == d$slide_id[1]]) else ""
-}
-if (STAIN != "none" && (!nzchar(xdir) || !dir.exists(xdir))) {
-  message("!! Xenium output folder of ", d$slide_id[1], " not found ('", xdir, "'): no stain, cells drawn as dots. ",
-          "Set EXP1_05D_XENIUM_DIR=/path/to/output-XETG... (the folder with morphology_focus/).")
-  STAIN <- "none"
-}
-chan_files <- if (STAIN != "none") sort(Sys.glob(file.path(xdir, "morphology_focus", "*.ome.tif"))) else character(0)
-if (STAIN != "none" && !length(chan_files)) chan_files <- Sys.glob(file.path(xdir, "morphology_focus.ome.tif"))
-stretch <- function(v) {                                   # 1st-99.8th percentile, mild gamma
-  q <- stats::quantile(v[v > 0], c(0.01, 0.998), na.rm = TRUE)
-  if (!all(is.finite(q)) || q[2] <= q[1]) return(v * 0)
-  pmin(pmax((v - q[1]) / (q[2] - q[1]), 0), 1)^0.8
-}
-get_bg <- function(x0, y0, x1, y1, tag) {
-  if (STAIN == "none") return(NULL)
-  crop <- function(file, kind) {
-    r <- crop_morphology(xdir, x0, y0, x1, y1, paste0(tag, "_", kind), image = file)
-    list(img = r$image, meta = r$meta)
-  }
-  dapi_file <- chan_files[grepl("dapi", basename(chan_files), ignore.case = TRUE)][1]
-  if (is.na(dapi_file)) dapi_file <- chan_files[1]
-  dp <- crop(dapi_file, "dapi")
-  extra <- NULL
-  idx <- c("dapi+boundary" = 2, "dapi+protein" = 4)[STAIN]
-  if (!is.na(idx)) {
-    if (length(chan_files) >= idx) extra <- crop(chan_files[idx], sub("dapi\\+", "", STAIN))$img else
-      message("!! No ", sub("dapi\\+", "", STAIN), " stain in ", xdir, " (only ", length(chan_files),
-              " morphology channel(s): multimodal segmentation kit not used?) -- DAPI only.")
-  }
-  k <- max(1, ceiling(max(dim(dp$img)) / 2200))           # keep ~2000 px across
-  sub_px <- function(a) a[seq(1, nrow(a), by = k), seq(1, ncol(a), by = k), drop = FALSE]
-  dv <- stretch(sub_px(dp$img)); ev <- if (is.null(extra)) dv * 0 else stretch(sub_px(extra))
-  rgb <- array(0, c(dim(dv), 3))
-  rgb[, , 1] <- pmin(1, 0.10 * dv + 0.55 * ev)
-  rgb[, , 2] <- pmin(1, 0.30 * dv + 0.55 * ev)
-  rgb[, , 3] <- pmin(1, 1.00 * dv + 0.55 * ev)
-  list(rgb = rgb, x0 = dp$meta$x0_um, x1 = dp$meta$x1_um, y0 = dp$meta$y0_um, y1 = dp$meta$y1_um)
-}
+STAIN <- "none"
+get_bg <- function(...) NULL
 
 ## y is plotted as -y_um (image convention: y grows downwards)
 plot_core <- function(d, panel_in, title, subtitle, bg = NULL) {

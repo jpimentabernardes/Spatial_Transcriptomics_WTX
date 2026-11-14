@@ -13,8 +13,9 @@
 ## Paths
 ## -----------------------------------------------------------------------
 ## ADAPT: where the raw data and outputs live on your cluster. Code stays in
-## the git repo; data never goes in the repo.
-PROJECT_DIR   <- Sys.getenv("EXP1_PROJECT_DIR", "/work_beegfs/sukmb430/Spatial_TMA")
+## the git repo; data never goes in the repo. Use a DIFFERENT folder from the
+## Xenium project: both pipelines write tables/02_cores_all.csv, figures/04_*, ...
+PROJECT_DIR   <- Sys.getenv("EXP1_PROJECT_DIR", "/work_beegfs/sukmb430/Spatial_TMA_WTX")
 CODE_DIR      <- Sys.getenv("EXP1_CODE_DIR", getwd())
 
 CONFIG_DIR    <- file.path(CODE_DIR, "config")
@@ -32,46 +33,98 @@ for (d in c(PROCESSED_DIR, FIGURES_DIR, TABLES_DIR, ANNOT_DIR, SEG_DIR, REG_DIR)
 SLIDES_CSV        <- file.path(CONFIG_DIR, "slides.csv")
 TMA_MAP_CSV       <- file.path(CONFIG_DIR, "tma_map.csv")
 MARKERS_RNA_CSV   <- file.path(CONFIG_DIR, "marker_panel_rna.csv")                 # human TMAs
-## MARKERS_RNA_CSV <- file.path(CONFIG_DIR, "marker_panel_rna_mouse_colon.csv")  # mouse colon (Swiss rolls)
-MARKERS_PROT_CSV  <- file.path(CONFIG_DIR, "marker_panel_protein.csv")
+## MARKERS_RNA_CSV <- file.path(CONFIG_DIR, "marker_panel_rna_mouse_colon.csv")  # mouse
 PROBE_EXPECT_CSV  <- file.path(CONFIG_DIR, "probe_expectations.csv")
-RNA_PROT_PAIRS_CSV <- file.path(CONFIG_DIR, "rna_protein_pairs.csv")
+FOV_TO_CORE_CSV   <- file.path(CONFIG_DIR, "fov_to_core.csv")        # optional, see 02 (mode D)
+GENE_NAME_MAP_CSV <- file.path(CONFIG_DIR, "gene_name_map.csv")      # optional, see 10
+XENIUM_PANEL_CSV  <- file.path(CONFIG_DIR, "xenium_panel_genes.csv") # optional; 10 writes it
 
 ## Paths inside slides.csv are relative to PROJECT_DIR unless absolute.
 resolve_path <- function(p) {
-  if (is.na(p) || !nzchar(p)) return(NA_character_)
+  if (is.null(p) || length(p) == 0 || is.na(p) || !nzchar(p)) return(NA_character_)
   if (grepl("^(/|[A-Za-z]:)", p)) p else file.path(PROJECT_DIR, p)
 }
 
 ## -----------------------------------------------------------------------
-## Segmentation used for everything downstream of 03c.
-##   "xenium"   = 10x Xenium Onboard Analysis output (default, always exists)
-##   "cellpose" = 03a_segment_cellpose.py output
-##   "segger"   = 03b_segment_segger.sh + 03b_segger_to_common.py output
-## Start with "xenium", run 03a-03c, then switch if the benchmark says so and
-## re-run 01 -> 02.
+## Platform. The object has ONE assay, named ASSAY, with the genes; Seurat then
+## names the per-cell totals nCount_CosMx / nFeature_CosMx.
 ## -----------------------------------------------------------------------
-SEGMENTATION <- Sys.getenv("EXP1_SEGMENTATION", "xenium")
+ASSAY <- "CosMx"
 
 ## -----------------------------------------------------------------------
-## Cell QC (01). ADAPT to panel size: colon panel + custom add-on is a few
-## hundred genes, so per-cell counts are far lower than scRNA-seq.
+## CosMx input (00, 01). See README "What CosMx delivers".
 ## -----------------------------------------------------------------------
-MIN_QV           <- 20     # 10x high-confidence transcript cutoff
-MIN_COUNTS       <- 10
-MIN_FEATURES     <- 5
-MIN_CELL_AREA    <- 6      # um^2 -- below this is almost always debris
-MAX_CELL_AREA    <- 600    # um^2 -- hard ceiling; a per-slide MAD ceiling is also applied
+## Pixel edge of the CosMx camera. 0.12028 um on all commercial instruments;
+## the 2022 NSCLC public data set (beta instrument) used 0.18. Only used where the
+## export has no um column (Area.um2 is used when present).
+COSMX_PIXEL_SIZE_UM <- 0.12028
+## Columns of the expression matrix that are NOT genes, by name:
+##   negative probes  = real probes against sequences that do not exist in the
+##                      transcriptome -> off-target hybridisation + background
+##   system controls  = barcodes that no probe carries ("false codes") -> decoding errors
+## They play the role of Xenium's "negative control probe" / "negative control
+## codeword" and are stored under the same names (nCount_ControlProbe /
+## nCount_ControlCodeword), so 05 and 10 treat both platforms the same way.
+COSMX_NEG_REGEX <- "^(Negative|NegPrb|NegProbe)"
+COSMX_SYS_REGEX <- "^(SystemControl|FalseCode)"
+## CosMx global coordinates have y growing UPWARDS (stage frame); every plot here
+## uses the image convention (y downwards, scale_y_reverse). TRUE = y is mirrored
+## on loading, so the tissue looks as in AtoMx. The original pixel coordinates
+## stay in the metadata (x_global_px, y_global_px) to go back to AtoMx / napari.
+COSMX_FLIP_Y <- TRUE
+## Rows of the expression matrix read per chunk. A WTX matrix has ~19,000
+## columns: one chunk of 2,000 cells is ~300 MB while it is being parsed.
+COSMX_CHUNK_ROWS <- 2000
+
+## -----------------------------------------------------------------------
+## Segmentation used for everything downstream.
+##   "cosmx" = the segmentation in the flat files (AtoMx; default, always exists)
+##   other   = a folder data/segmentation/<name>/<slide_id>/ holding either another
+##             flat-file export (e.g. a re-segmentation done in AtoMx) or the common
+##             format (cell_feature_matrix/ + cells.csv.gz). Compare with 03, then
+##             set the name here and re-run 01 -> 02.
+## -----------------------------------------------------------------------
+SEGMENTATION <- Sys.getenv("EXP1_SEGMENTATION", "cosmx")
+
+## -----------------------------------------------------------------------
+## Cell QC (01). ADAPT. These defaults are for the whole-transcriptome panel
+## (~19,000 genes; typically several hundred to >1,000 transcripts per cell) and
+## are deliberately lenient: 01 prints what a "2.5 SD below the mean of
+## log10(counts)" rule would give on YOUR data, and 02 shows the result per core.
+## -----------------------------------------------------------------------
+MIN_COUNTS       <- 50
+MIN_FEATURES     <- 30
+MIN_CELL_AREA    <- 10     # um^2 -- below this is almost always debris
+MAX_CELL_AREA    <- 1000   # um^2 -- hard ceiling; a per-slide MAD ceiling is also applied
 AREA_MAD_UPPER   <- 5      # flag cells > median + 5 MAD of log(area)
-MAX_CONTROL_FRAC <- 0.05   # flag cells where >5% of counts are negative controls
+MAX_CONTROL_FRAC <- 0.1    # flag cells where >10% of counts are negative probes / system controls (AtoMx default)
+## Cells cut by a field-of-view (FOV) border: CosMx segments each FOV on its own,
+## so a cell on the border is two half cells. SplitRatioToLocal (metadata) is the
+## area of a border cell relative to the mean cell area of its FOV (0 = not on a
+## border). Border cells below this ratio are flagged. NA = do not flag.
+MIN_SPLIT_RATIO  <- 0.5
+## FOV QC. An FOV whose cells have few transcripts is flagged (not removed) in 01
+## (absolute) and in 02 (relative to the other FOVs of the SAME core, which is the
+## fair comparison on a multi-organ TMA).
+FOV_MIN_CELLS           <- 50
+FOV_MIN_MEDIAN_COUNTS   <- 50
+FOV_MIN_RATIO_TO_CORE   <- 0.5   # FOV median counts / median of its core's other FOVs
 
 ## QC maps in 01 (whole-slide plots)
 QC_MAP_POINT_SIZE <- 0.3     # bigger = denser-looking tissue
 QC_MAP_MAX_CELLS  <- 1e6     # cells drawn per figure (random subsample above this)
+## Zoomed QC inspection (01, section 7): cell outlines from the polygons file
+INSPECT_WINDOW_UM   <- 150     # side of each zoom window
+INSPECT_N_PER_SLIDE <- 3       # windows chosen automatically per slide (mix of pass + fail)
+## Your own windows instead (centre in um, as read off 01_qc_fail_spatial_by_slide.png):
+## INSPECT_CENTERS <- data.frame(slide_id = "TMA_ORGAN", x = 5200, y = 3100)
+INSPECT_CENTERS     <- NULL
 
 ## -----------------------------------------------------------------------
 ## TMA dearraying (02). Cores are usually 0.6-2 mm diameter with >= 200 um
 ## gaps; if neighbouring cores get merged, set a fixed DBSCAN_EPS_UM below the gap.
+## On CosMx only the FOVs you placed are imaged (0.51 x 0.51 mm each), so a
+## "core" is the part of the core covered by FOVs.
 ## -----------------------------------------------------------------------
 DBSCAN_EPS_UM        <- NA    # NA = adaptive (3 x median kNN distance); or a fixed value in um
 DBSCAN_MIN_PTS       <- 10
@@ -84,32 +137,36 @@ PSEUDO_TMA_SLIDES       <- NULL       # NULL = all slides; or c("TMA_ORGAN")
 PSEUDO_CORE_DIAMETER_UM <- 600        # typical TMA needle: 0.6-1.5 mm
 PSEUDO_CORE_PITCH_UM    <- 1000       # centre-to-centre distance of the punch grid
 PSEUDO_MIN_CELLS        <- 500        # a punch must contain this many QC-pass cells
-PSEUDO_PATIENT_ID       <- NULL       # NULL = slide_id; e.g. "mouse1" if both rolls are one animal
+PSEUDO_PATIENT_ID       <- NULL       # NULL = slide_id
 PSEUDO_ORGAN            <- "colon"
 PSEUDO_CENTERS          <- NULL       # roll centre per slide, e.g. data.frame(slide_id = "TMA_ORGAN", x = 5000, y = 4800)
 
 ## Core-level QC: cores failing these are flagged (not removed) in 02.
 CORE_MIN_CELLS         <- 500
-CORE_MIN_MEDIAN_COUNTS <- 20
+CORE_MIN_MEDIAN_COUNTS <- 100
 
 ## -----------------------------------------------------------------------
 ## Clustering / annotation (04)
 ## -----------------------------------------------------------------------
+## Whole transcriptome: PCA runs on the N_HVG most variable genes PLUS every gene
+## of marker_panel_rna.csv, CANONICAL_MARKERS and probe_expectations.csv (so the
+## genes you annotate with are never dropped). ScaleData makes a dense
+## (N_HVG x cells) matrix: 2,000 genes x 500,000 cells = 8 GB.
+N_HVG            <- 2000
 N_PCS            <- 30
 USE_HARMONY      <- TRUE     # correct slide effects, NOT organ/patient effects
 RES_CLUSTERS     <- 0.8      # 04: clustering of all cells (ST_clusters); higher = more, finer clusters
-RES_LEVEL1       <- 0.3      # 06 (CellScape): lineage clustering
-RES_LEVEL2       <- 0.6      # 06 (CellScape): sub-clustering within a lineage
 TOP_N_PER_CLUSTER <- 5       # 04: top FindAllMarkers genes per cluster shown in the dot plot
 MARKERS_MAX_CELLS <- 2000    # 04: cells per cluster used by FindAllMarkers (speed; Inf = all)
 ## 04: canonical markers always shown in the dot plot, next to the top markers of
 ## each cluster. Matched to the panel ignoring case (Epcam = EPCAM); genes not on
-## the panel are listed and dropped. ADAPT to tissue / panel.
+## the panel are listed and dropped. ADAPT to tissue.
 CANONICAL_MARKERS <- c(
-  "Epcam", "Mki67", "Lgr5", "Olfm4", "Stmn1", "Atoh1", "Apoa4", "Fabp1", "Alpi",
-  "Slc26a3", "Car4", "Agr2", "Muc2", "Lyz1", "Defa5", "Mmp7", "Dclk1", "Trpm5",
-  "Chga", "Cd3d", "Cd4", "Cd8a", "Foxp3", "Il7r", "Ccr5", "Gzmb", "Ncam1",
-  "Cd79a", "Ighm", "Xcr1", "Itgax", "Itgam", "Csf1r", "Fcgr1", "Ly6c1", "Ly6g", "Siglecf"
+  "EPCAM", "KRT8", "KRT19", "KRT20", "MKI67", "LGR5", "OLFM4", "MUC2", "CHGA",
+  "PTPRC", "CD3E", "CD4", "CD8A", "FOXP3", "NKG7", "MS4A1", "CD79A", "JCHAIN", "MZB1",
+  "CD68", "CD163", "C1QA", "CD14", "S100A8", "TPSAB1", "KIT", "CLEC9A", "LILRA4",
+  "COL1A1", "DCN", "PDGFRA", "ACTA2", "MYH11", "DES", "RGS5", "PECAM1", "VWF", "LYVE1",
+  "PLP1", "S100B", "ALB", "SFTPC", "PMEL"
 )
 ## 04: cluster -> cell type, YOUR call, from figures/04_top_markers_dotplot_transcriptomics.png
 ## and 04_ST_clusters_spatial_<slide>.png. 04 writes a ready-to-fill template with
@@ -117,54 +174,17 @@ CANONICAL_MARKERS <- c(
 ## copy it here, fill in the names, re-run 04. NULL = cells are labelled cluster_<n>.
 ## Cluster numbers change with the data, SEGMENTATION and RES_CLUSTERS: re-check
 ## the mapping whenever those change (04 stops if a cluster has no name).
-## Annotation of ST_clusters of the current Xenium dataset (Swiss rolls, SEGMENTATION =
-## "xenium", 28 clusters 0-27) using the previous label vocabulary. Comments = the
-## markers the call is based on (04_top_markers_dotplot_transcriptomics.png).
-CLUSTER_TO_CELLTYPE <- c(
-  "0"  = "Stem cells",               # Mki67, Stmn1, Myc, Lgr5
-  "1"  = "Goblet cells 1",           # Atoh1-high, Agr2, Muc2 (immature/secretory progenitor)
-  "2"  = "Colonocytes Lipid 1",      # Ppara, Pparg, Reg3g, Cdkn1a
-  "3"  = "Colonocytes Distal",       # Slc26a3/Car4-high, no Reg3g -> CHECK spatially
-  "4"  = "Goblet cells 1",           # Asns, Atoh1, Agr2, Muc2
-  "5"  = "Colonocytes",              # Srebf1, Fasn, Mki67 (proliferative)
-  "6"  = "Macrophages",              # Csf1r, Fcgr1, Itgam (+ B/T contamination)
-  "7"  = "Fibroblast",               # Pdgfra, Col1a1, Ly6c1, Pdpn
-  "8"  = "Colonocytes",              # Sesn2, Myc, Stmn1
-  "9"  = "Colonocytes",              # Ppargc1a, Slc26a3, Car4
-  "10" = "Colonocytes Tryp+",        # Nampt (NAD salvage)
-  "11" = "Enteroendocrine cells",    # Tph1, Chga
-  "12" = "Colonocytes Tryp-",        # Ddit4; no Trp/NAD module genes
-  "13" = "Colonocytes",              # Duox2, Nos2, Hk2 (inflamed surface)
-  "14" = "Stromal",                  # Ahr, Pdgfra, Col1a1
-  "15" = "Colonocytes Lipid 3",      # Lpcat3
-  "16" = "Fibroblast",               # Wipi1, Pdgfra, Col1a1
-  "17" = "Tuft cells",               # Dclk1, Trpm5, Siglecf
-  "18" = "Colonocytes Tryp+",        # Ace2, Cd38, Gdf15
-  "19" = "Goblet cells 2",           # Muc2, Agr2 (mature)
-  "20" = "Colonocytes Lipid 2",      # Pdk4, Pparg, Car4
-  "21" = "Colonocytes Tryp+",        # Ace2 (Muc2 signal -> check)
-  "22" = "Lymphatic nodes",          # Lyve1, Pdpn (lymphatic endothelium)
-  "23" = "Stromal",                  # Acta2, Atf4 (smooth muscle)
-  "24" = "Pericytes",                # Pdk4, Acta2, Abca1
-  "25" = "Stromal",                  # Gls, Acta2 (smooth muscle)
-  "26" = "T cells",                  # Cd3d, Cd8a, Gzmb
-  "27" = "Enteric neurons"           # Ncam1, Stmn1, Chga, Sox10
-)
+## For the Xenium <-> CosMx comparison (10) use the SAME names as in the Xenium
+## project wherever the cell type is the same; cell types that only the whole
+## transcriptome resolves get new names.
+CLUSTER_TO_CELLTYPE <- NULL
 ## Lineage per cluster, one of Epithelial / Immune / Fibroblast / Endothelial /
 ## Smooth_muscle_pericyte / Neural_glia (level-1 names of marker_panel_rna.csv):
-## 05 uses lineage == "Immune" and matches probe_expectations.csv to these names.
+## 05 uses lineage == "Immune" and matches probe_expectations.csv to these names,
+## 10 compares the two platforms lineage by lineage.
 ## NULL = the marker-signature suggestion written in the template.
-CLUSTER_TO_LINEAGE <- c(
-  "0"  = "Epithelial",  "1"  = "Epithelial",  "2"  = "Epithelial",  "3"  = "Epithelial",
-  "4"  = "Epithelial",  "5"  = "Epithelial",  "6"  = "Immune",      "7"  = "Fibroblast",
-  "8"  = "Epithelial",  "9"  = "Epithelial",  "10" = "Epithelial",  "11" = "Epithelial",
-  "12" = "Epithelial",  "13" = "Epithelial",  "14" = "Fibroblast",  "15" = "Epithelial",
-  "16" = "Fibroblast",  "17" = "Epithelial",  "18" = "Epithelial",  "19" = "Epithelial",
-  "20" = "Epithelial",  "21" = "Epithelial",  "22" = "Endothelial",                     # lymphatic endothelium
-  "23" = "Smooth_muscle_pericyte",  "24" = "Smooth_muscle_pericyte",  "25" = "Smooth_muscle_pericyte",
-  "26" = "Immune",      "27" = "Neural_glia"
-)
-USE_UCELL        <- TRUE     # rank-based scores; robust to small panels. Falls back to AddModuleScore
+CLUSTER_TO_LINEAGE <- NULL
+USE_UCELL        <- TRUE     # rank-based scores. Falls back to AddModuleScore
 
 ## -----------------------------------------------------------------------
 ## Aim 1 / Aim 2 (05)
@@ -176,45 +196,20 @@ NICHE_K_NEIGHBOURS <- 20
 N_NICHES           <- 8
 
 ## -----------------------------------------------------------------------
-## CellScape (06). ADAPT: column names differ between CellScape software
-## versions/exports -- open your export and set these.
+## Xenium (probe panel) <-> CosMx (whole transcriptome) comparison (10)
 ## -----------------------------------------------------------------------
-CS_ID_COL        <- "CellID"
-CS_X_COL         <- "X"
-CS_Y_COL         <- "Y"
-CS_AREA_COL      <- "Area"
-CS_COORD_UNITS   <- "px"        # "px" or "um"; px are multiplied by cellscape_pixel_size_um
-CS_MARKER_REGEX  <- "_Mean$"    # regex picking the per-marker mean-intensity columns
-CS_MARKER_STRIP  <- "_Mean$"    # removed from column names to get the marker name
-CS_DAPI_MARKER   <- "DAPI"
-CS_ARCSINH_COFACTOR <- NA       # NA = per-marker cofactor (5th percentile of positive values)
-CS_EXCLUDE_MARKERS <- c("DAPI") # not used for clustering
-
-## -----------------------------------------------------------------------
-## RNA <-> protein integration (08)
-## -----------------------------------------------------------------------
-NN_MAX_DIST_UM   <- 15     # nearest-cell transfer cutoff (serial sections: cells are NOT the same cells)
-NBHD_RADIUS_UM   <- 30     # neighbourhood-averaged protein per Xenium cell
-BIN_SIZE_UM      <- 50     # spatial bins for RNA-protein correlation
-
-## -----------------------------------------------------------------------
-## Zoomed QC inspection (01, section 6)
-## -----------------------------------------------------------------------
-## Python with tifffile + zarr (env/py_imaging.yml), used to crop the morphology
-## image. ADAPT: e.g. "/home/you/miniconda3/envs/exp1-imaging/bin/python"
-PYTHON_BIN          <- Sys.getenv("EXP1_PYTHON", "python3")
-INSPECT_WINDOW_UM   <- 150     # side of each zoom window
-INSPECT_N_PER_SLIDE <- 3       # windows chosen automatically per slide (mix of pass + fail)
-## Your own windows instead (centre in um, as read off 01_qc_fail_spatial_by_slide.png):
-## INSPECT_CENTERS <- data.frame(slide_id = "TMA_ORGAN", x = 5200, y = 3100)
-INSPECT_CENTERS     <- NULL
-## Compare with cellpose in each zoom window, same QC rules. Inside a core that 03a
-## segmented with save_masks = TRUE, 03a's own result is used (data/segmentation/
-## cellpose/<slide>/masks/); elsewhere cellpose runs on the window itself with the
-## settings below (keep them equal to 03a's). Running cellpose needs it in
-## PYTHON_BIN's environment, ~1-2 min per window on CPU. FALSE = 10x cells only.
-INSPECT_CELLPOSE           <- TRUE
-INSPECT_CELLPOSE_MODE      <- "nuclei_expand"   # as 03a --mode
-INSPECT_CELLPOSE_EXPAND_UM <- 5                 # as 03a --expand-um
+## ADAPT: output folder of the Xenium pipeline (spatial_transcriptomics_proteomics,
+## its EXP1_PROJECT_DIR) and the segmentation used there. 10 reads
+## <XENIUM_PROJECT_DIR>/data/processed/xenium_<XENIUM_SEGMENTATION>_annotated.rds
+## (or _insights.rds). Cores are matched by core_id: use the same core_id in both
+## projects' tma_map.csv (or give config/core_id_map.csv: cosmx_core_id,xenium_core_id).
+XENIUM_PROJECT_DIR  <- Sys.getenv("EXP1_XENIUM_PROJECT_DIR", "/work_beegfs/sukmb430/Spatial_TMA")
+XENIUM_SEGMENTATION <- Sys.getenv("EXP1_XENIUM_SEGMENTATION", "xenium")
+CORE_ID_MAP_CSV     <- file.path(CONFIG_DIR, "core_id_map.csv")       # optional
+CMP_MIN_CELLS_CORE  <- 200    # a core is compared only with this many cells on BOTH platforms
+CMP_MIN_CELLS_GROUP <- 50     # same, per core x lineage
+CMP_REGISTER        <- TRUE   # align each CosMx core onto the Xenium core (needed for 10 section 4d)
+CMP_BIN_UM          <- 50     # spatial bins for the registered comparison (serial sections: not the same cells)
+CMP_MIN_NCC         <- 0.3    # a core counts as registered if the two cell-density maps correlate at least this much
 
 set.seed(42)
